@@ -994,8 +994,8 @@ def deliver(gw, cfg, text, thread=None, ack_timeout=30, mark=None):
     # Wait for delivery: our message.user must show up in history with a
     # seq. Closing the connection before that can drop the message.
     from .wait import user_ack
-    user_seq, ack_deadline = None, time.time() + ack_timeout
-    while user_seq is None and time.time() < ack_deadline:
+    user_seq, ack_deadline = None, time.monotonic() + ack_timeout
+    while user_seq is None and time.monotonic() < ack_deadline:
         try:
             h = gw.call_json("chat.history", body={"limit": 10, **scope})
             user_seq = user_ack(h.get("chat_events", []), baseline, text)
@@ -1317,6 +1317,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
     approved, approve_errors = [], []
     conn = connector or connect
     recheck_after = RECHECK_AFTER if recheck_after is None else recheck_after
+    deadline = time.monotonic() + timeout
     if enabled:
         approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn,
                                                   allow_once=once_enabled)
@@ -1334,7 +1335,11 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
                 lim = limit
             g = conn(cfg)
             try:
-                resp = g.call_json("chat.history", body={"limit": lim, **scope})
+                kw = {"body": {"limit": lim, **scope},
+                      "timeout": max(0.1, deadline - time.monotonic())}
+                if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                    kw["_deadline"] = deadline
+                resp = g.call_json("chat.history", **kw)
                 evs = resp.get("chat_events", []) or []
             finally:
                 g.close()
@@ -1358,7 +1363,11 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             try:
                 g = conn(cfg)
                 try:
-                    resp = g.call_json("chat.history", body={"limit": lim, **scope})
+                    kw = {"body": {"limit": lim, **scope},
+                          "timeout": max(0.1, deadline - time.monotonic())}
+                    if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                        kw["_deadline"] = deadline
+                    resp = g.call_json("chat.history", **kw)
                     evs = resp.get("chat_events", []) or []
                 finally:
                     g.close()
@@ -1377,7 +1386,6 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         after_seq = derive_after_seq()
     w = Waiter(thread=thread, require_running=require_running, approver=approver)
     body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
-    deadline = time.monotonic() + timeout
     user_stop = should_stop or (lambda: False)
     forced = [False]
     last_record = [time.monotonic()]

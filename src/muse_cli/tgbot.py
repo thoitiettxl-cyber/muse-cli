@@ -426,7 +426,7 @@ class Turn:
             if name == "delta.text_append":
                 key = self._part_key(p)
                 self.parts[key] = self.parts.get(key, "") + str(p.get("text") or "")
-                self.last_delta = self.bot.clock()
+                self.last_delta = time.monotonic()
                 self.dirty = True
             elif name == "delta.message_start":
                 # a re-subscription may restart the stream of a message: start it over
@@ -439,7 +439,7 @@ class Turn:
                 if isinstance(full, str) and full.strip():
                     self.parts[key] = full
                     self.dirty = True
-                self.last_delta = self.bot.clock()
+                self.last_delta = time.monotonic()
             elif not self.cancel_requested:
                 st = status_from_event(ev)
                 online = name == "agent.status" and p.get("activity_code") == "online"
@@ -809,9 +809,9 @@ class Bot:
         return self.media_pool.submit(self._timed_download, r)
 
     def _timed_download(self, r):
-        t0 = time.time()
+        t0 = time.monotonic()
         data = self.muse.download(r)
-        return data, time.time() - t0
+        return data, time.monotonic() - t0
 
     def send_media(self, chat_id, session_id, seq, r, prefix="", fetched=None, claimed=False):
         """Download one file Muse showed and send it (photo/video/audio/document),
@@ -827,7 +827,7 @@ class Bot:
             self.send(chat_id, f"📎 {esc(prefix)}<b>{esc(what)}</b> is {r['byte_len'] // (1024 * 1024)} MB, "
                                f"too big for Telegram. Get it with <code>muse-cli download</code>.")
             return True
-        t0 = time.time()
+        t0 = time.monotonic()
         try:
             got = fetched.result(timeout=MEDIA_FETCH_WAIT) if fetched is not None else None
             data, dl = got if got else self._timed_download(r)
@@ -837,12 +837,12 @@ class Bot:
             self.send(chat_id, f"📎 {esc(prefix)}Muse showed <b>{esc(what)}</b>, but I could not fetch it "
                                f"({esc(type(e).__name__)}). /files lists it for a retry.")
             return True
-        t2 = time.time()
+        t2 = time.monotonic()
         try:
             self.send_doc(chat_id, name, data, caption=caption, mime=r.get("mime"))
             log.info("media sent chat=%s seq=%s kind=%s bytes=%d download=%.2f wait=%.2f upload=%.2f",
                      chat_id, seq, file_kind(name, r.get("mime"), len(data)), len(data),
-                     dl, t2 - t0, time.time() - t2)
+                     dl, t2 - t0, time.monotonic() - t2)
         except Exception as e:  # noqa: BLE001
             log.warning("media send failed seq=%s %s: %s", seq, name, str(e)[:200])
             self.release_media(chat_id, session_id, seq, r)
@@ -1082,8 +1082,8 @@ class Bot:
     def _queued_notice(self, chat_id, turn, ahead):
         if turn is not None and not ahead:
             turn.recheck_requested = True
-            end = time.time() + QUEUE_RECHECK
-            while not turn.finished and time.time() < end:
+            end = time.monotonic() + QUEUE_RECHECK
+            while not turn.finished and time.monotonic() < end:
                 time.sleep(0.25)
             if turn.finished:
                 log.info("queue chat=%s: previous turn was over on re-check; sending now", chat_id)
@@ -1247,7 +1247,7 @@ class Bot:
         last_poll = 0.0
         while not turn.finished:
             time.sleep(0.5)
-            now = self.clock()
+            now = time.monotonic()
             if turn.user_seq and now - turn.last_delta > POLL_FALLBACK and now - last_poll > POLL_FALLBACK:
                 last_poll = now
                 try:
@@ -2586,8 +2586,8 @@ def pair(api, code, timeout=600, out=print, sleep=time.sleep):
             offset = old[-1]["update_id"] + 1
     except Exception:  # noqa: BLE001
         pass
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             ups = api.call("getUpdates", offset=offset, timeout=20, allowed_updates=["message"],
                            _http_timeout=30)
