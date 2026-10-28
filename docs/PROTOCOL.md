@@ -290,7 +290,13 @@ collide on the path-only dedup key (pre-existing). Single-flight
 `server_check` is a follow-up: bounding check threads would break the
 pinned property that a hung check never suppresses the next cadence
 check. A reply with no terminal ever still times out (124) by design
-(R4, Boss decision open). `transcript_revision` semantics unresolved.
+(R4, Boss decision open). `transcript_revision` semantics unresolved. Subagent-own-root
+running-first: a subagent's root-confirmed `running` arriving before any
+main-root `running` is indistinguishable from main-root `running` in a
+single event, so the waiter could learn the subagent root and ignore the
+main root's terminal — causal ordering (the main agent must be running
+before it can spawn a subagent, and fresh subscribes replay terminals,
+not running records) makes this unlikely; known residual.
 
 ### Wait constants (0.6.1)
 
@@ -298,19 +304,29 @@ Watchdog 20 s without scoped progress (provisional — no progress-gap
 measurement supports tightening it); state-check budget 8 s subscribe
 (warm `task_state()` max 0.184 s over 5 calls, cold connect up to
 3.272 s); reconnect: each wait-path connect capped at 30 s
-(`connect_timeout=30` on `_wait_connection` → `bounded_connect`), the
-connect itself moved out from under `shared_lock` in `live()` so a slow
+(`connect_timeout=30` on `_wait_connection` → `bounded_connect`). The 30 s
+cap is the CLI wait path only; the Telegram follower's Bot Muse uses
+the 60 s default cap, so the hang bound below does not cover bot
+follows. The connect itself moved out from under `shared_lock` in `live()` so a slow
 handshake cannot serialise other threads, a storm of failed resubscribes
 switches to one bounded state check after 30 s, and resubscribe backoff
 sleeps are capped by the remaining caller deadline; heartbeat 25 s;
 state check only on a suspected gap; final history read floored at 5 s;
 lag window ~2 s after an empty `done` final read.
-Evidence-based hang bound: caller timeout + 65 s worst overshoot (30 s
-in-flight wait-path connect + 35 s final phase: 30 s connect + 5 s
-read; concurrent state checks do not delay the return, backoff cannot
-overshoot the deadline). A 20 s harness therefore ends by ~85 s, inside
-the 90 s Floor; the 35 s Target is unreachable by design (one hung
-connect alone can consume 30 s).
+Hang bound (CLI wait path only; the Telegram follower's Bot Muse uses
+the 60 s default connect cap, so this bound does not cover bot
+follows): caller timeout + 67 s worst overshoot (30 s in-flight
+wait-path connect + 37 s final phase: 30 s connect + 5 s floored final
+read + 2 s lag window), plus up to ~9 s pathological close cost
+(6 s heartbeat join + ~3 s gateway close) — 87 s typical, 96 s
+pathological, on a 20 s harness. Two readings: the detection bound
+from silence to report is watchdog 20 s + reconnect 30 s + final 7 s
+= 57 s, comfortably inside the 90 s Floor (this is the claimed Floor
+reading); the elapsed wall-time bound including close (87 s typical /
+96 s pathological) is NOT claimed to be inside the 90 s Floor. The
+35 s Target is unreachable by design (one hung connect alone can
+consume 30 s). Concurrent state checks do not delay the return, and
+backoff cannot overshoot the deadline.
 
 M2 honesty: live terminal-to-exit latency is UNMEASURED post-fix. Do not
 cite the pre-fix exiting-subset numbers (median 0.469 s, p95 0.541 s,

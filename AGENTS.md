@@ -37,7 +37,8 @@
 - `wait` (and `send --wait/--until-done`) survive a connection that dies
   silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
   replaces a dead connection and resubscribes (each wait-path connect capped
-  at 30 s; a reconnect storm switches to one bounded state check after 30 s),
+  at 30 s, CLI wait path only — the Telegram follower uses the 60 s default
+  cap; a reconnect storm switches to one bounded state check after 30 s),
   and checks the turn state on the server only when a gap is suspected
   (20 s without scoped progress, 8 s budget), so a turn that ended while the
   stream was deaf is reported at once with its final replies. A live terminal
