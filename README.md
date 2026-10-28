@@ -323,7 +323,7 @@ hop is about 0.1 s.
 | `/rename <title>`, `/pin`, `/unpin`, `/archive`, `/unarchive`, `/delete` | manage the current side chat (`/delete` asks first) |
 | `/approvals` | pending approvals with Always allow / Deny buttons |
 | `/autoapprove on\|off\|status` | default **on**: every approval gets Muse's forever choice (`allow_always`) so Muse never blocks |
-| `/autoapprove once on\|off\|status` | default **off**: approvals with no forever option fall back to `allow_once` when auto-approve is on; the CLI `auto-approve once` command writes only `config.json`, so a running bot needs a restart to pick it up |
+| `/autoapprove once on\|off\|status` | default **off**: approvals with no forever option fall back to `allow_once` when auto-approve is on. This is the bot's own setting (in `telegram-state.json`); `muse-cli auto-approve once` changes only the CLI's `wait`/`send`. Approvals that still can't be decided come with buttons |
 | `/watch on\|off` | forward live tool/progress events (batched) |
 | `/files` | recent files Muse made; tap to download |
 | `/fs ls\|tree\|cat\|get\|find\|stat\|mkdir\|mv\|rm …` | System Files (`rm` asks first; long `cat` comes as a file) |

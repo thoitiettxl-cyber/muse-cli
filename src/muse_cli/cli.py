@@ -237,6 +237,8 @@ def auto_allow_once_setting(cfg, flag=None):
 def cmd_auto_approve(args):
     cfg = load_config()
     once_state = getattr(args, "once_state", None)
+    if once_state is not None and args.state != "once":
+        raise ValueError(f"unexpected {once_state!r}: use `auto-approve once on|off|status`")
     if args.state in ("on", "always"):
         cfg["auto_approve"] = "always"
         save_config(cfg)

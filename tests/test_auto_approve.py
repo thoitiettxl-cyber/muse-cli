@@ -160,6 +160,17 @@ class AllowOnceSettingTest(unittest.TestCase):
         self.assertEqual(saved["auto_allow_once"], False)
         self.assertEqual(saved["node_id"], "n")
 
+    def test_stray_once_state_is_an_error_not_ignored(self):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "config.json")
+        with open(f, "w") as fh:
+            json.dump({"node_id": "n", "cookies_file": "c", "auto_approve": "off"}, fh)
+        with mock.patch.object(cli, "CONFIG_DIR", d), mock.patch.object(cli, "CONFIG_FILE", f):
+            with self.assertRaises(ValueError):       # `auto-approve on off`: ambiguous
+                cli.cmd_auto_approve(argparse.Namespace(state="on", once_state="off"))
+            with open(f) as fh:
+                self.assertEqual(json.load(fh)["auto_approve"], "off")   # nothing changed
+
     def test_allow_once_flags_parse(self):
         p = argparse.ArgumentParser()
         cli._auto_allow_once_flags(p)

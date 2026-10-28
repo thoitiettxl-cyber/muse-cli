@@ -94,11 +94,14 @@ config. Auto-approve defaults to off; the fallback defaults to off. The
 Telegram bot defaults auto-approve to on and the fallback to off;
 `/autoapprove once on|off|status` toggles the fallback, stored in
 `telegram-state.json` and mirrored to the profile's `config.json`, and
-takes effect in the running bot. By contrast `muse-cli auto-approve once
-on|off` writes only `config.json`: the bot reads `telegram-state.json`
-once at startup and never reloads it, so a running bot needs a restart
-to pick the CLI change up. `muse-cli telegram status` reports the
-bot's stored `auto_allow_once` value.
+takes effect in the running bot. The bot only ever reads its own
+`telegram-state.json` value: `muse-cli auto-approve once on|off` writes
+only `config.json` and changes `wait`/`send`, not the bot (not even after
+a restart); use `/autoapprove once on|off` for the bot.
+`muse-cli telegram status` reports the bot's stored `auto_allow_once`
+value. In the bot, an approval auto-approve cannot decide (no forever
+option with the fallback off, or deny-only) gets buttons for the choices
+Muse offers (Always allow, or Allow once, and Deny).
 
 ## Cutting a release
 

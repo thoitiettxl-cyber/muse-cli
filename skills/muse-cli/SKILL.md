@@ -303,8 +303,8 @@ default; enable it with `/autoapprove once on` (stored in
 `telegram-state.json`, mirrored to the profile's `config.json`, effective
 in the running bot); check both
 toggles with `/autoapprove once status`. `muse-cli auto-approve once on|off`
-writes only `config.json`, so a running bot needs a restart to pick it up;
-`muse-cli telegram status` reports the bot's stored value. `muse-cli stop [--thread ID]` stops
+writes only `config.json` and does not change the bot (not even after a
+restart); `muse-cli telegram status` reports the bot's stored value. `muse-cli stop [--thread ID]` stops
 Muse's current turn from the terminal (`chat.cancel`).
 
 ## Escape hatch

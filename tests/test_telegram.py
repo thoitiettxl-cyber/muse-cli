@@ -2418,3 +2418,34 @@ def test_failed_reconnects_in_a_row_also_notify_once(home):
         with pytest.raises(ConnectionError):
             muse.live()
     assert len([t for t in tg.texts() if "Can't reach Muse" in t]) == 1
+
+
+# -- review fixes for the allow_once fallback (0.6.0) -----------------------------------------
+def test_background_undecidable_approval_gets_allow_once_buttons(env):
+    env.bot.on_pending([NO_FOREVER])                 # auto-approve on, fallback off
+    assert env.s.decided == []
+    assert sum("🔐" in (t or "") for t in env.tg.texts()) == 1   # not left unseen
+    assert "✅ Allow once" in env.tg.buttons() and "✅ Always allow" not in env.tg.buttons()
+    env.bot.on_pending([NO_FOREVER])                 # announced once
+    assert sum("🔐" in (t or "") for t in env.tg.texts()) == 1
+    press(env, "✅ Allow once")
+    assert env.s.decided == [("a9", "allow_once")]
+    assert "Allowed once" in env.tg.texts()[-1]
+
+
+def test_turn_needs_approval_buttons_match_offered_options(env):
+    env.s.approvals = [NO_FOREVER]
+    env.s.script = lambda sid: [ts("running"), snapshot(NO_FOREVER)]
+    env.bot.handle_update(msg("clone the repo"))      # fallback off: the turn stops for a human
+    assert "🔐 Approval" in env.tg.sent("editMessageText")[-1]["text"]
+    assert "✅ Allow once" in env.tg.buttons() and "✅ Always allow" not in env.tg.buttons()
+
+
+def test_turn_note_names_kind_and_scope(env):
+    env.bot.state["auto_allow_once"] = True
+    env.s.approvals = [NO_FOREVER]
+    env.s.script = lambda sid: [ts("running"), snapshot(NO_FOREVER),
+                                lambda: env.s.add(sid, "message.assistant", "cloned"), ts("completed")]
+    env.bot.handle_update(msg("clone the repo"))
+    final = env.tg.sent("editMessageText")[-1]["text"]
+    assert "auto-approved (once): Share info with github.com [network_access github.com]" in final

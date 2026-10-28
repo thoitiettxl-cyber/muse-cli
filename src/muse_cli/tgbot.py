@@ -868,7 +868,7 @@ class Bot:
         self.claim_wait_seconds = 15.0  # bound for waiting on another thread's claim
         self.notified = set()      # approval ids already announced
         self.warned_no_forever = set()  # approval ids already warned about (warning only)
-        self.auto_log = []         # (time, approval_id, title, decision) auto-approved
+        self.auto_log = []         # (time, approval_id, title, decision, kind, scope) auto-approved
         self.monitors = {}
         self.watch_buf = []
         self.watch_last = 0.0
@@ -1528,8 +1528,9 @@ class Bot:
             t, aid, title = entry[0], entry[1], entry[2]
             decision = entry[3] if len(entry) > 3 else FOREVER
             label = "always" if decision == FOREVER else "once"
+            where = " ".join(str(x) for x in entry[4:6] if x)
             if t >= turn.started:
-                notes.append(f"✅ auto-approved ({label}): {title or aid}")
+                notes.append(f"✅ auto-approved ({label}): {title or aid}" + (f" [{where}]" if where else ""))
         markup = None
         if outcome == "needs_input":
             opts = question_options(res)
@@ -1540,8 +1541,7 @@ class Bot:
             for a in res.get("approvals") or []:
                 notes.append(f"🔐 Approval: {a.get('title')}: {a.get('question') or ''}")
                 args = (turn.session_id, turn.title, turn.user_seq)
-                rows.append([button("✅ Always allow", self.cb("decide", a["approval_id"], FOREVER, *args)),
-                             button("❌ Deny", self.cb("decide", a["approval_id"], "deny", *args))])
+                rows.append(self.approval_row(a, args))
                 self.notified.add(a["approval_id"])
             markup = keyboard(rows)
         elif outcome == "failed":
@@ -1701,7 +1701,7 @@ class Bot:
             evs = self.turn_history(turn)
         self.set_watermark(turn.session_id, max((e.get("seq") or 0 for e in evs), default=None))
 
-    def _record_claim(self, claim, aid, decision, title):
+    def _record_claim(self, claim, aid, decision, title, kind=None, scope=None):
         """Record a successful decide for a claim owned by this call.
 
         Returns True only if this call owned the claim when it resolved:
@@ -1716,7 +1716,7 @@ class Bot:
                 return False
             self.decided_approvals[aid] = decision
             claim.decision = decision
-            self.auto_log = self.auto_log[-50:] + [(self.clock(), aid, title, decision)]
+            self.auto_log = self.auto_log[-50:] + [(self.clock(), aid, title, decision, kind, scope)]
             claim.event.set()
             if self._inflight_claims.get(aid) is claim:
                 del self._inflight_claims[aid]
@@ -1834,7 +1834,8 @@ class Bot:
                         log.warning("auto-approve %s failed: %s", aid, e)
                         self._fail_claim(claim, aid)
                         continue
-                    if self._record_claim(claim, aid, decision, a.get("title")):
+                    if self._record_claim(claim, aid, decision, a.get("title"), a.get("kind"),
+                                          a.get("scope")):
                         done.append(aid)
                         log.info("auto-approved %s (%s): %s [%s %s]", aid, decision,
                                  a.get("title"), a.get("kind"), a.get("scope"))
@@ -1874,7 +1875,13 @@ class Bot:
                     label = "always" if decisions.get(d["approval_id"], FOREVER) == FOREVER else "once"
                     self.notify(f"✅ Auto-approved ({label}): {esc(d.get('title') or d['approval_id'])}",
                                 silent=True)
-            return
+            # Approvals auto-approve may not decide (no forever option and
+            # the allow_once fallback off, or deny-only) would otherwise sit
+            # unseen: they get buttons like with auto-approve off.
+            described = [d for d in described if d["approval_id"] not in self.decided_approvals
+                         and choose_auto_decision(d, True, self.auto_allow_once) is None]
+            if not described:
+                return
         if any(not t.finished for t in list(self.turns.values())):
             return   # the running turn shows its own buttons when it stops
         for d in described:
@@ -1889,15 +1896,26 @@ class Bot:
             t += f"\n<i>{esc(d['why'])}</i>"
         return t
 
-    def approval_markup(self, d, resume=(None, None, None)):
+    def approval_row(self, d, resume=(None, None, None)):
+        """Buttons for the choices Muse offers: Always allow (or Allow once
+        when there is no forever option) and Deny."""
+        from .wait import ONCE, offers_once
         aid = d["approval_id"]
-        return keyboard([[button("✅ Always allow", self.cb("decide", aid, FOREVER, *resume)),
-                          button("❌ Deny", self.cb("decide", aid, "deny", *resume))]])
+        row = []
+        if offers_forever(d):
+            row.append(button("✅ Always allow", self.cb("decide", aid, FOREVER, *resume)))
+        elif offers_once(d):
+            row.append(button("✅ Allow once", self.cb("decide", aid, ONCE, *resume)))
+        row.append(button("❌ Deny", self.cb("decide", aid, "deny", *resume)))
+        return row
+
+    def approval_markup(self, d, resume=(None, None, None)):
+        return keyboard([self.approval_row(d, resume)])
 
     def cb_decide(self, chat_id, mid, aid, decision, session_id, title, after_seq):
         with self.muse.gw() as g:
             cli.decide_approval(g, aid, decision)
-        label = "✅ Always allowed" if decision == FOREVER else "❌ Denied"
+        label = {FOREVER: "✅ Always allowed", "allow_once": "✅ Allowed once"}.get(decision, "❌ Denied")
         self.send(chat_id, f"{label}: <code>{esc(aid)}</code>", silent=True)
         if mid:
             try:
