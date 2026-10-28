@@ -76,3 +76,35 @@ def test_chat_new_replies_uses_shared_self_referential_rule():
     answers_user["payload"]["reply_to_message_id"] = "user-msg-9"
     got = _chat([push, genuine, answers_user]).new_replies(10)
     assert [e["seq"] for e in got] == [12, 13]
+
+
+class _IdleGW:
+    """A subscription that stays open and silent until told to stop."""
+    def subscribe_raw(self, method, body=None, max_records=0, idle_timeout=0,
+                      overall_timeout=0, on_record=None, should_stop=None, **_kw):
+        end = time.monotonic() + overall_timeout
+        while time.monotonic() < end:
+            if should_stop is not None and should_stop():
+                return
+            time.sleep(0.01)
+
+    def call_json(self, method, body=None, **_kw):
+        return {"chat_events": []}
+
+    def close(self):
+        pass
+
+
+def test_server_check_thread_auth_error_surfaces():
+    """An expired login seen by the periodic check (a daemon thread) ends
+    the wait with AuthError instead of being swallowed until timeout."""
+    def connector(cfg):
+        if threading.current_thread().name == "wait-check":
+            raise AuthError("auth/check -> 401")
+        return _IdleGW()
+
+    t0 = time.monotonic()
+    with pytest.raises(AuthError):
+        cli._run_wait({}, None, 5, timeout=15, connector=connector, auto_approve=False,
+                      check_every=0.1, recheck_after=100)
+    assert time.monotonic() - t0 < 5

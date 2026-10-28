@@ -1497,6 +1497,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
     wlock = threading.RLock()  # the Waiter is fed by the stream and by server_check
     last_check = [time.monotonic()]
     first_failure_at = [0.0]   # start of the current reconnect storm
+    auth_error = [None]        # AuthError seen by a server_check thread: ends the wait
 
     def server_check():
         """Read the turn state on its own short subscription (the server
@@ -1547,11 +1548,18 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             info = task_status_info(ev, thread)
             if info and info["status"] == "running" and info["root_confirmed"]:
                 last_record[0] = time.monotonic()  # confirmed progress
+        except AuthError as e:
+            # Expired login: not a transient failure. Hand it to the wait
+            # loop (this may run on a daemon thread), which stops and
+            # re-raises it so the caller reports an auth error, not 124.
+            auth_error[0] = e
         except Exception as e:  # noqa: BLE001 - a safety net must never break the wait
             log.debug("wait: periodic check failed: %s", e)
 
     def stop_now():
         if user_stop():
+            return True
+        if auth_error[0] is not None:
             return True
         if w.result is not None:
             return True
@@ -1655,7 +1663,8 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             server_check()
 
     attempt, failures = 0, 0
-    while w.result is None and time.monotonic() < deadline and not user_stop():
+    while (w.result is None and time.monotonic() < deadline and not user_stop()
+           and auth_error[0] is None):
         if attempt:
             # failures counts consecutive ones: a single drop resubscribes after RESUB_PAUSE
             remaining = deadline - time.monotonic()
@@ -1703,6 +1712,8 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         if w.result is None and not user_stop() and time.monotonic() < deadline:
             log.debug("wait: re-checking the server (%s; status %s)",
                       "requested" if forced[0] else "no events / stream ended", w.status)
+    if auth_error[0] is not None:
+        raise auth_error[0]
     kind, detail = w.result or ("timeout", w.status)
     if kind == "timeout" and w.ignored_terminal in FAILED:
         # The wait ended (timeout or stop) with a replayed FAILED terminal
