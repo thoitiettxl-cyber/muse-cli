@@ -3,7 +3,8 @@
 ## Layout
 
 - `src/muse_cli/` is the package: `cli.py` (commands), `gateway.py` (auth,
-  Noise transport), plus `routes.json` and `desc0.bin`/`desc1.bin` data files.
+  Noise transport), `conn.py` (the shared warm connection with heartbeat and
+  reconnect, used by both `wait` and the Telegram bot), plus `routes.json` and `desc0.bin`/`desc1.bin` data files.
 - `tgbot.py` is `muse-cli telegram` (bot loop, commands, systemd unit) and
   `tgapi.py` its Telegram Bot API client and formatting (curl_cffi, no bot
   framework). Bot logic calls the data helpers in `cli.py` (`deliver`,
@@ -33,6 +34,14 @@
 - `send` always waits for the delivery ack (our message appears in history
   with a seq) before exiting; it exits 5 if no ack arrives. Never close the
   connection before that (no raw fire-and-forget).
+- `wait` (and `send --wait/--until-done`) survive a connection that dies
+  silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
+  replaces a dead connection and resubscribes; connects and the Noise
+  handshake are bounded (60 s / 20 s), and every 60 s the turn state is
+  checked on the server, so a turn that ended while the stream was deaf is
+  reported at once with its final replies. Reconnects are quiet; only after
+  about a minute without Muse does stderr get one `wait: can't reach Muse`
+  line (and `wait: reconnected` when it is back). Exit codes are unchanged.
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
   `4` needs a human: a question in the final reply (widget or plain text,

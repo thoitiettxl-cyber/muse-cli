@@ -93,6 +93,9 @@ def join_chunks(partial, ntf):
     return b"".join(parts[i] for i in sorted(parts))
 
 
+HANDSHAKE_TIMEOUT = 20   # seconds for the server's Noise handshake reply
+
+
 class ConnectionDown(ConnectionError):
     """The connection was already down when a request was made: nothing was
     sent, so the request is safe to repeat on a new connection."""
@@ -382,7 +385,9 @@ class Gateway:
         noise.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))
         noise.start_handshake()
         self.ws.send_bytes(bytes(noise.write_message(b"")))
-        m2, _ = self.ws.recv()
+        # WebSocket.recv() waits forever: a server that accepts the socket and
+        # then goes silent would hang this connect (and `muse-cli wait`) for good.
+        m2 = self._recv_handshake(HANDSHAKE_TIMEOUT)
         noise.read_message(bytes(m2))
         self.ws.send_bytes(bytes(noise.write_message(b"")))
         assert noise.handshake_finished
@@ -397,8 +402,39 @@ class Gateway:
         self.closed = False
         self.dead = None    # the exception that killed the reader, if any
         self.last_used = time.time()
+        self.last_recv = time.time()   # last frame from the server (heartbeat: silent death)
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name="muse-gw-reader")
         self._reader.start()
+
+    def _recv_handshake(self, timeout):
+        """One websocket message during connect, or TimeoutError."""
+        from curl_cffi.const import CurlECode, CurlWsFlag
+        from curl_cffi.curl import CurlError
+        from select import select
+        sock = self.ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+        deadline = time.time() + timeout
+        chunks = []
+        while True:
+            try:
+                chunk, frame = self.ws.curl.ws_recv()
+            except CurlError as e:
+                if e.code != CurlECode.AGAIN:
+                    self.ws.close()
+                    raise ConnectionError(f"gateway handshake failed: {e}") from None
+                left = deadline - time.time()
+                if left <= 0:
+                    self.ws.close()
+                    raise TimeoutError(f"gateway handshake: no answer in {timeout:.0f}s")
+                select([sock], [], [], min(left, 0.5))
+                continue
+            if frame.flags & CurlWsFlag.CLOSE:
+                self.ws.close()
+                raise ConnectionError("gateway closed the websocket during the handshake")
+            if frame.flags & (CurlWsFlag.PING | CurlWsFlag.PONG):
+                continue
+            chunks.append(chunk)
+            if frame.bytesleft == 0 and not frame.flags & CurlWsFlag.CONT:
+                return b"".join(chunks)
 
     @property
     def alive(self):
@@ -495,6 +531,7 @@ class Gateway:
         try:
             while not self.closed:
                 sf = self._read_frame()
+                self.last_recv = time.time()
                 with self._streams_lock:
                     q = self._streams.get(sf.stream_id)
                 if q is not None:

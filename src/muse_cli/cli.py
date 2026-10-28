@@ -1036,10 +1036,22 @@ def _send_finish(args, cfg, scope, user_seq, stream_sid, gw=None):
         return
     # Follow the turn on the connection that sent it (multiplexed): no new
     # connect + Noise handshake per subscription or history read.
-    conn = (lambda _cfg: gw.lease()) if gw is not None and hasattr(gw, "lease") else None
-    code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True,
-                         auto_approve=args.auto_approve, connector=conn,
-                         auto_allow_once=getattr(args, "auto_allow_once", None))
+    # The heartbeat replaces it if it dies silently, like `wait`'s own.
+    own = conn = None
+    if gw is not None and hasattr(gw, "lease"):
+        own = _wait_connection(cfg)
+        own.adopt(gw)
+        own.start_heartbeat()
+        conn = own.connect
+    try:
+        code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True,
+                             auto_approve=args.auto_approve, connector=conn,
+                             auto_allow_once=getattr(args, "auto_allow_once", None))
+    finally:
+        if own is not None:
+            own.stop_heartbeat()
+            if own.shared is not gw:
+                own.reset()       # a replacement connection; cmd_send closes gw
     result.update(outcome=res["outcome"], status=res["status"], final_text=res["final_text"],
                   replies=res["replies"])
     for k in ("approvals", "auto_approved", "auto_approve_errors", "widgets", "question",
@@ -1160,10 +1172,48 @@ ONLINE_GRACE = 3        # Muse said "online" (idle) but no turn end followed wit
 RESUB_PAUSE = 1.0       # pause before re-subscribing after a stream ended
 
 
+CHECK_EVERY = 60        # safety net: re-read the turn state from the server this often
+
+
+def _wait_connection(cfg, log=None):
+    """The warm, heartbeat-checked connection a CLI wait runs on. Only an
+    outage longer than a minute is reported on stderr (once), then its end."""
+    import logging
+    from .conn import Muse
+    log = log or logging.getLogger("muse_cli.wait")
+    return Muse(cfg=cfg, log=log,
+                on_down=lambda err, secs: log.warning(
+                    "wait: can't reach Muse for %.0fs (%s); still retrying", secs, err),
+                on_up=lambda secs: log.warning("wait: reconnected to Muse after %.0fs", secs))
+
+
 def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
              on_event=None, auto_approve=None, connector=None, approver=None,
              should_stop=None, recheck=None, recheck_after=None, log=None,
-             auto_allow_once=None):
+             auto_allow_once=None, check_every=None):
+    """See _run_wait. Without a connector (the CLI), the wait runs on its own
+    warm connection with a heartbeat (conn.Muse): a connection that dies
+    silently is detected, replaced, and the subscription resumed."""
+    import logging
+    log = log or logging.getLogger("muse_cli.wait")
+    own = None
+    if connector is None:
+        own = _wait_connection(cfg, log)
+        own.start_heartbeat()
+        connector = own.connect
+    try:
+        return _run_wait(cfg, thread, after_seq, timeout, require_running, on_event, auto_approve,
+                         connector, approver, should_stop, recheck, recheck_after, log,
+                         auto_allow_once, check_every)
+    finally:
+        if own is not None:
+            own.close()
+
+
+def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
+              on_event=None, auto_approve=None, connector=None, approver=None,
+              should_stop=None, recheck=None, recheck_after=None, log=None,
+              auto_allow_once=None, check_every=None):
     """Subscribe until the turn ends, a human is needed, or timeout.
 
     auto_approve: True/False per call, None to use MUSE_AUTO_APPROVE or the
@@ -1185,7 +1235,14 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     - when no record arrives for recheck_after seconds (watchdog), or the
       stream ends, or recheck() returns True, the subscription is reopened
       on a fresh connection: the server replays the current task.status, so
-      the state is re-read from the server instead of waiting forever.
+      the state is re-read from the server instead of waiting forever;
+    - a dropped connection (detected by the connector's heartbeat) is
+      replaced and the subscription reopened the same way, so a turn that
+      ended during the gap is reported at once with its replies;
+    - every check_every seconds (CHECK_EVERY) the turn state is also read
+      on a separate short subscription, plus chat.history when needed,
+      while the main stream stays open: a missed turn end is caught even
+      when the stream looks alive.
 
     Returns (exit_code, result). The final replies are re-read from
     chat.history on a fresh connection (the subscription's reader thread
@@ -1194,7 +1251,9 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     from .wait import (Waiter, replies_after, exit_code, outcome_of, needs_input_reason,
                        question_of, in_scope)
     import logging
+    import threading
     log = log or logging.getLogger("muse_cli.wait")
+    check_every = CHECK_EVERY if check_every is None else check_every
     scope = {"session_id": thread} if thread else {}
     enabled, _src = auto_approve_setting(cfg, auto_approve)
     # An explicitly supplied allow_once value is used as-is, without
@@ -1243,10 +1302,50 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     forced = [False]
     last_record = [time.time()]
     online_at = [0.0]          # when Muse said "online" (idle) mid-turn
+    wlock = threading.RLock()  # the Waiter is fed by the stream and by server_check
+    last_check = [time.time()]
+    checking = threading.Lock()
+
+    def server_check():
+        """Read the turn state on its own short subscription (the server
+        replays task.status) and settle it like a live one."""
+        if not checking.acquire(blocking=False):
+            return
+        try:
+            g = conn(cfg)
+            try:
+                s = task_state(g, thread, timeout=8)
+            finally:
+                g.close()
+            if not s:
+                return
+            ev = {"event": "task.status", "payload": {"status": s, "session_id": thread,
+                                                      "is_thread": bool(thread)}}
+            with wlock:
+                if w.result is None:
+                    w.feed(ev)
+                pending = w.result is None and w.ignored_terminal
+            if pending:
+                replies = history_replies()
+                with wlock:
+                    if w.result is None and w.ignored_terminal:
+                        w.settle(replies)
+            if w.result is not None:
+                log.info("wait: periodic check: turn over (status %s)", w.status)
+        except Exception as e:  # noqa: BLE001 - a safety net must never break the wait
+            log.debug("wait: periodic check failed: %s", e)
+        finally:
+            last_check[0] = time.time()
+            checking.release()
 
     def stop_now():
         if user_stop():
             return True
+        if w.result is not None:
+            return True
+        if check_every and time.time() - last_check[0] > check_every and not checking.locked():
+            last_check[0] = time.time()
+            threading.Thread(target=server_check, daemon=True, name="wait-check").start()
         if (recheck and recheck()) or (recheck_after and time.time() - last_record[0] > recheck_after):
             forced[0] = True
             return True
@@ -1262,8 +1361,9 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     def on_record(line):
         if on_event:
             on_event(line)
-        if w.feed(line) is not None:
-            return True
+        with wlock:
+            if w.result is not None or w.feed(line) is not None:
+                return True
         try:
             ev = json.loads(line)
         except (ValueError, TypeError):
@@ -1287,7 +1387,9 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
             except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
                 log.debug("history check failed: %s", e)
                 return False
-            if w.settle(replies) is not None:
+            with wlock:
+                settled = w.settle(replies)
+            if settled is not None:
                 log.info("turn already over (status %s, %d reply(s) after seq %s)",
                          w.status, len(replies), after_seq)
                 return True
@@ -1333,14 +1435,15 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
                       "requested" if forced[0] else "no events / stream ended", w.status)
     kind, detail = w.result or ("timeout", w.status)
     replies = []
-    gw = conn(cfg)
     try:
-        h = gw.call_json("chat.history", body={"limit": 30, **scope})
-        replies = replies_after(h.get("chat_events", []), after_seq)
-    except (GatewayError, TimeoutError):
-        pass
-    finally:
-        gw.close()
+        gw = conn(cfg)
+        try:
+            h = gw.call_json("chat.history", body={"limit": 30, **scope})
+            replies = replies_after(h.get("chat_events", []), after_seq)
+        finally:
+            gw.close()
+    except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+        log.warning("wait: could not read the final replies: %s", e)
     res = {"outcome": outcome_of(kind, replies), "status": w.status, "after_seq": after_seq,
            "final_text": replies[-1]["text"] if replies else None, "replies": replies}
     if kind == "approval":
