@@ -1571,7 +1571,8 @@ def test_resubscribed_stream_does_not_duplicate_text(env):
     for _ in range(2):   # the same message streamed again after a re-subscription
         t.on_event(json.dumps({"event": "delta.message_start", "payload": {"message_id": "a"}}))
         t.on_event(json.dumps({"event": "delta.text_append", "payload": {"message_id": "a", "text": "Hi"}}))
-    assert t.parts["a"] == "Hi"
+    assert list(t.parts.values()) == ["Hi"]
+    assert t.body() == "Hi"
 
 
 def _online():

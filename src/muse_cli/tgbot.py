@@ -60,6 +60,7 @@ MONITOR_IDLE = 60             # monitor subscribe: no record this long ends the 
 MONITOR_OVERALL = 300         # monitor subscribe: hard cap, then resubscribe
 MEDIA_WAIT_TOTAL = 300        # shared budget for all of one turn's live-media jobs
 MEDIA_FETCH_WAIT = 120        # bound on waiting for one prefetched media download
+CLAIM_CHAIN_MAX = 3           # claim takeovers followed before taking over anyway
 QUEUE_RECHECK = 8            # a new message waits this long for a re-checked turn to end
 
 COMMANDS = [
@@ -355,12 +356,16 @@ class Turn:
         set on one key, the partial kept on the other) and truncating it
         on a resubscription restart (reset hits the wrong key). Both ids
         seen on one event name the same message, so they map to one
-        canonical key; the first id seen wins."""
+        canonical key; the first id seen wins. Keys are namespaced by
+        field (message_id:9 vs message_seq:9): a seq reused after a
+        resubscribe must not merge into an earlier message sharing the
+        bare string. _part_keys lives on the per-turn TurnState, so a
+        new turn starts with a fresh map (the resubscribe reset)."""
         ids = []
         for field in ("message_id", "message_seq"):
             v = p.get(field)
             if v is not None:
-                ids.append(str(v))
+                ids.append(f"{field}:{v}")
         for i in ids:
             if i in self._part_keys:
                 canon = self._part_keys[i]
@@ -469,7 +474,7 @@ class Turn:
                     for field in ("message_id", "message_seq"):
                         v = _payload(e).get(field)
                         if v is not None:
-                            self._part_keys[str(v)] = key
+                            self._part_keys[f"{field}:{v}"] = key
         if texts:
             with self.lock:
                 if list(texts.values()) != list(self.parts.values()):
@@ -897,6 +902,18 @@ class Bot:
                 turn.msg_id = None
                 turn.live_order.append(r["path"])
             self.send_media(chat_id, turn.session_id, seq, r, fetched=fut, claimed=True)
+            if not self.media_sent(chat_id, turn.session_id, seq, r):
+                # send_media returns True even on failure (after sending
+                # a notice and releasing the claim): the file was NOT
+                # delivered, so it must stay in the end-of-turn retry
+                # set instead of being marked live-sent. The watermark
+                # still caps at `upto`, which includes this file's seq:
+                # a file failing BOTH the live and the end-of-turn send
+                # is passed by the watermark and reachable only via
+                # /files. That residual is documented, not fixed here.
+                with turn.lock:
+                    if r["path"] in turn.live_order:
+                        turn.live_order.remove(r["path"])
             turn.timing.mark("media_sent")
         finally:
             with turn.edit_lock:
@@ -1536,9 +1553,14 @@ class Bot:
         within claim_wait_seconds, takeover is a fresh claim this caller
         owns and must decide itself. If a different claim took over in
         the meantime, wait on that one instead of overwriting it, so
-        three concurrent callers cannot each decide the same id."""
+        three concurrent callers cannot each decide the same id. A chain
+        of takeovers is followed at most CLAIM_CHAIN_MAX hops: past that
+        the waiter takes over anyway (superseding the chain head too, so
+        its owner cannot record a decision alongside the takeover),
+        bounding the wait at CLAIM_CHAIN_MAX x claim_wait_seconds."""
         aid = a["approval_id"]
         current = claim
+        hops = 0
         while True:
             settled = current.event.wait(self.claim_wait_seconds)
             with self.lock:
@@ -1546,8 +1568,12 @@ class Bot:
                     return True, None
                 nxt = self._inflight_claims.get(aid)
                 if nxt is not None and nxt is not current:
-                    current = nxt
-                    continue
+                    hops += 1
+                    if hops < CLAIM_CHAIN_MAX:
+                        current = nxt
+                        continue
+                    nxt.superseded = True
+                    current.superseded = True
                 if not settled:
                     current.superseded = True
                 if self._inflight_claims.get(aid) is current:

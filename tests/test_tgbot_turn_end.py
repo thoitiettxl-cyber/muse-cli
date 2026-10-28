@@ -70,6 +70,76 @@ def test_part_key_unifies_message_id_and_message_seq():
     assert turn.body() == "hello"
 
 
+def test_part_key_namespaces_ids_by_field():
+    """F14: a message_id of "9" and a message_seq of 9 are DIFFERENT
+    messages (a reused seq after a resubscribe must not merge into an
+    earlier message that happens to share the bare string)."""
+    turn = _turn(None)
+    turn.on_event(_line("delta.message_start", {"message_id": "9"}))
+    turn.on_event(_line("delta.text_append", {"message_id": "9", "text": "first"}))
+    turn.on_event(_line("delta.message_start", {"message_seq": 9}))
+    turn.on_event(_line("delta.text_append", {"message_seq": 9, "text": "second"}))
+    assert turn.body() == "first\n\nsecond"
+
+
+def test_failed_live_send_leaves_file_for_end_of_turn_retry(env):
+    """Fix 7: a live file whose download fails is removed from
+    live_order (send_media returns True even on failure), so the
+    end-of-turn pass re-sends it instead of it vanishing from both."""
+    r = {"path": "sandbox://x.png", "byte_len": 10, "mime": "image/png"}
+    turn = _turn(env.bot)
+    turn.user_seq = 1
+    env.s.download_error = True
+    ev = json.loads(_line("delta.presentation", {
+        "resources": [dict(r)], "chat_event_seq": 5}))
+    env.bot.live_media(turn, ev)
+    assert "sandbox://x.png" not in turn.live_order
+    assert env.bot.media_sent(OWNER, None, 5, r) is False
+    env.s.download_error = False
+    res = {"replies": [{"seq": 6, "text": "here it is"}]}
+    evs = [{"seq": 5, "event_name": "delta.presentation",
+            "payload": {"resources": [dict(r)]}}]
+    env.bot.finish_split(turn, res, evs, [], None)
+    assert len(env.tg.docs) == 1
+
+
+def test_await_claim_churn_is_capped(env):
+    """F12: a chain of takeovers cannot keep a waiter following claims
+    forever: after CLAIM_CHAIN_MAX hops it takes over, bounded."""
+    bot = env.bot
+    bot.claim_wait_seconds = 0.05
+    aid = "a-churn"
+    first = tgbot._InFlightClaim()
+    with bot.lock:
+        bot._inflight_claims[aid] = first
+    stop = threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            with bot.lock:
+                bot._inflight_claims[aid] = tgbot._InFlightClaim()
+            time.sleep(0.02)
+
+    t = threading.Thread(target=churn, daemon=True)
+    t.start()
+    out = {}
+
+    def go():
+        out["r"] = bot._await_claim({"approval_id": aid}, first)
+
+    waiter = threading.Thread(target=go, daemon=True)
+    waiter.start()
+    try:
+        waiter.join(2)
+        assert not waiter.is_alive(), "_await_claim followed the claim chain unbounded"
+        done, takeover = out["r"]
+        assert done is False and takeover is not None
+        assert bot._inflight_claims[aid] is takeover
+    finally:
+        stop.set()
+        t.join(2)
+
+
 def test_wait_media_total_budget_bounds_all_jobs():
     """wait_media's budget is shared across jobs: three stuck downloads end
     in ~the budget, not 3x the per-job timeout."""
