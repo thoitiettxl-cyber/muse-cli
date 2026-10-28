@@ -180,11 +180,14 @@ muse-cli redeem <CODE>                # redeem a friend's invite code: one-time,
   connection before that (no raw fire-and-forget).
 - `wait` (and `send --wait/--until-done`) survive a connection that dies
   silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
-  replaces a dead connection and resubscribes; connects and the Noise
-  handshake are bounded (60 s / 20 s), and every 60 s the turn state is
-  checked on the server, so a turn that ended while the stream was deaf is
-  reported at once with its final replies. Reconnects are quiet; only after
-  about a minute without Muse does stderr get one `wait: can't reach Muse`
+  replaces a dead connection and resubscribes under one shared 30 s deadline
+  (connect + Noise handshake), and checks the turn state on the server only
+  when a gap is suspected (20 s without scoped progress, 8 s budget), so a
+  turn that ended while the stream was deaf is reported at once with its
+  final replies. Only the root agent's `completed` (after `running`) ends a
+  turn; `interrupted` after `running` exits 2 with no history proof.
+  Reconnects are quiet; only after about a minute without Muse does stderr
+  get one `wait: can't reach Muse`
   line (and `wait: reconnected` when it is back). Exit codes are unchanged.
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·

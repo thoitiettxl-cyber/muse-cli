@@ -149,8 +149,11 @@ reads in 4 MiB windows until `eof` and writes in 4 MiB append chunks.
 Live `chat.subscribe` replays current state on connect, then streams:
 
 - `task.status` payload `{status, agent_id, root_agent_id, task_id, session_id,
-  is_thread, active_subagent_count}`; seen values `running`, `completed`.
-  Only the root agent's status (agent_id == root_agent_id) ends a turn.
+  is_thread, active_subagent_count}`. The full vocabulary is measured in
+  "Turn-end semantics" below: only the root agent's `completed` ends a
+  turn, and only after `running` was seen from that root; other strings
+  are suspect and need history proof. `task_id` is the agent's identity,
+  constant per agent and equal to `root_agent_id` — never a turn epoch.
 - `approvals.snapshot` payload `{emitted_at_ms, pending_approvals[], recent_approvals[]}`;
   each approval has `approval_id`, `display.{summary_title, short_explanation,
   permission_question{kind,scope,text}, detail_rows}`, `payload.network_payload`,
@@ -166,3 +169,84 @@ Routes: `egress.approvals` GET /approvals (`pending`, `pending_approvals`,
 `recent`); `egress.approval.decide` POST /approvals/{id}/decide `{decision}` with
 decision in `allow_once|allow_session|allow_today|allow_always|deny|deny_always`
 (server also lists `timed_out`, `auto_allow`).
+
+## Turn-end semantics (measured live, 2026-10-28)
+
+Measured against a live account over 30 turns plus 2 cancels, driving
+`chat.subscribe` and `chat.history` directly. Where this section differs
+from older notes, it wins. Counts below are those measurements; anything
+not measured is marked unresolved.
+
+### `task.status` vocabulary
+
+| Value | Meaning for `wait` |
+|---|---|
+| `completed`, root agent, `running` seen first | DONE (exit 0), after the history settle below |
+| `interrupted`, root agent, `running` seen first | FAILED (exit 2); no history proof required |
+| `running`, root agent only | The only in-progress value; the only value that may set `seen_running` |
+| `pending_init` | Suspect, never progress, for any agent |
+| `idle`, `complete`, `done`, `finished`, `succeeded`, `success`, and every other DONE/FAILED-looking string | Suspect-and-require-settle: stored, settled against history, accepted only with history proof + root scope + `running` seen; with no proof the wait keeps waiting, never exits 0 empty |
+| Any `task.status` from a non-root agent | Never terminal, whatever the string |
+| Root terminal with `active_subagent_count > 0` | Suspect, re-check (provisional: one observation, non-root `completed` 4.532 s before root `completed`) |
+
+Scope: filter `agent_id == root_agent_id` when `root_agent_id` is present;
+a missing root id makes the event suspect. `sessions.updated` /
+`tasks.updated` arrive on scoped subscribes and must never count as
+progress; scope-check every event kind by `session_id` when present.
+A fresh subscribe replays the last terminal state (`completed` on a fresh
+thread, `interrupted` after a cancel): a replay terminal alone never ends
+a wait — it needs `running` seen in this wait first.
+
+### History settle
+
+A history event counts as a delivered reply only if ALL hold:
+`event_name = message.assistant`, `payload.status` exactly `completed`,
+`reply_to_message_id` empty at BOTH the event and the payload level,
+`seq > after_seq`, `seq <=` the upper bound captured at terminal /
+state-check time. Dedup by (`seq`, `message_id`). `interrupted`-status
+assistant events are partials (two observed, 1998/2464 chars) and are
+excluded from replies, while the `interrupted` terminal itself needs no
+history proof. Media/widget-carrying completed assistant events count as
+replies even with empty text. `delta.presentation` and non-assistant
+events are excluded. Never use `transcript_revision` as a bound (observed
+constant 4993 against `seq_max` 4994, unresolved). Window: `limit=200`
+plus growth while `has_more` is set — `routes.json` has no cursor. The
+settled terminal is cleared only on a successful settle.
+
+### The `after_seq` boundary
+
+A standalone `wait` without an explicit `--after-seq` derives its
+boundary from the LAST `message.user` seq in a history window (or from a
+caller-supplied `user_seq`), never from the latest event's seq: the old
+`limit=1` latest-event snapshot made `after_seq` equal the reply's own seq
+whenever the reply had already landed, excluding it forever (split
+send+wait: 11 exit 0 / 9 exit 124 over 20 turns, perfectly separated by
+completion time). If no user event is found, the boundary is 0 and the
+wait relies on terminal + scope checks. Integrated `send --wait` passes
+the delivery `user_seq` and was immune.
+
+### Not turn signals
+
+`chat.stream_events` (global snapshot, no `task.status`),
+`tasks.subscribe` (no records while idle), `subagents.status` (400/404),
+`tasks.runs` (scheduled background jobs only). Do not use them to detect
+turn end.
+
+### Unresolved (do not assume)
+
+FAILED strings other than `interrupted`; the `idle` value; the
+approval-pending `task.status` value (0 pending in 3 elicitation
+attempts); whether a decide can safely be retried after a lost reply
+(`_safe_to_repeat("egress.approval.decide")` is False, no idempotency key
+— never retry a decide blindly). `approvals.snapshot` carries no
+`session_id`, so approval filtering cannot be proved session-scoped.
+
+### Wait constants (0.6.1)
+
+Watchdog 20 s without scoped progress (provisional — no progress-gap
+measurement supports tightening it); state-check budget 8 s (warm
+`task_state()` max 0.184 s over 5 calls, cold connect up to 3.272 s);
+reconnect budget 30 s as ONE shared monotonic deadline including connect
++ Noise handshake; heartbeat 25 s; state check only on a suspected gap.
+Evidence-based hang bound: 20 + 30 + 5 = 55 s (arithmetic on the
+constants above, not a measured worst case).
