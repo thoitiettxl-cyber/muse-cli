@@ -40,7 +40,7 @@ from .gateway import AuthError, GatewayError
 from .tgapi import (CHUNK, UPLOAD_LIMIT, TelegramAPI, TelegramError, button, doc_name, esc,
                     file_kind, keyboard, md_to_html, needs_document, split_text)
 from .wait import (FOREVER, choose_auto_decision, describe_approval, event_name,
-                   offers_forever, pending_approvals)
+                   in_scope, offers_forever, pending_approvals)
 
 log = logging.getLogger("muse_cli.telegram")
 
@@ -55,6 +55,11 @@ CHATS_PAGE = 8
 MAX_FILES_PER_TURN = 6
 MAIN = "main"                # state key for the main chat (session_id None)
 WATCHDOG = 20                # a turn with no live record this long is re-checked on the server
+MONITOR_WATCHDOG = 60         # a monitor with no scoped progress this long resubscribes + checks history
+MONITOR_IDLE = 60             # monitor subscribe: no record this long ends the stream
+MONITOR_OVERALL = 300         # monitor subscribe: hard cap, then resubscribe
+MEDIA_WAIT_TOTAL = 300        # shared budget for all of one turn's live-media jobs
+MEDIA_FETCH_WAIT = 120        # bound on waiting for one prefetched media download
 QUEUE_RECHECK = 8            # a new message waits this long for a re-checked turn to end
 
 COMMANDS = [
@@ -323,6 +328,7 @@ class Turn:
         self.cancel_requested = False
         self.stop_waiting = False
         self.finished = False
+        self.delivering = False  # finish_turn is sending the reply: monitor must not forward it too
         self.recheck_requested = False
         self.app_status = None    # the Muse app's live status line, preferred over our labels
         self.seen_work = False
@@ -338,6 +344,33 @@ class Turn:
         self.media_jobs = []
         self._media_exec = None
         self.main_events = threading.Event()   # the turn's own subscription is delivering
+        self._part_keys = {}     # alternate message id -> canonical parts key (see _part_key)
+
+    def _part_key(self, p):
+        """One parts key per message, whatever id a delta carries.
+
+        A message's start may carry message_id while its appends/done carry
+        message_seq (or vice versa): keying parts on the raw id splits one
+        message into two parts, duplicating it on message_done (full text
+        set on one key, the partial kept on the other) and truncating it
+        on a resubscription restart (reset hits the wrong key). Both ids
+        seen on one event name the same message, so they map to one
+        canonical key; the first id seen wins."""
+        ids = []
+        for field in ("message_id", "message_seq"):
+            v = p.get(field)
+            if v is not None:
+                ids.append(str(v))
+        for i in ids:
+            if i in self._part_keys:
+                canon = self._part_keys[i]
+                for j in ids:
+                    self._part_keys[j] = canon
+                return canon
+        canon = ids[0] if ids else "m"
+        for i in ids:
+            self._part_keys[i] = canon
+        return canon
 
     def media_exec(self):
         if self._media_exec is None:
@@ -345,13 +378,19 @@ class Turn:
             self._media_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tg-media")
         return self._media_exec
 
-    def wait_media(self, timeout=300):
-        """Block until every live file of this turn went out (or failed)."""
+    def wait_media(self, timeout=MEDIA_WAIT_TOTAL):
+        """Block until every live file of this turn went out (or failed).
+
+        TIMEOUT is one shared budget for all jobs, not per job: six stuck
+        downloads used to hold finish_turn for up to 1800 s."""
+        deadline = time.monotonic() + timeout
         for f in list(self.media_jobs):
             try:
-                f.result(timeout=timeout)
+                f.result(timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:  # noqa: BLE001
                 log.warning("live media: %s", e)
+            if time.monotonic() >= deadline:
+                break
         if self._media_exec is not None:
             self._media_exec.shutdown(wait=False)
 
@@ -385,17 +424,17 @@ class Turn:
                     log.warning("live media: %s", e)
         with self.lock:
             if name == "delta.text_append":
-                key = str(p.get("message_id") or p.get("message_seq") or "m")
+                key = self._part_key(p)
                 self.parts[key] = self.parts.get(key, "") + str(p.get("text") or "")
                 self.last_delta = self.bot.clock()
                 self.dirty = True
             elif name == "delta.message_start":
                 # a re-subscription may restart the stream of a message: start it over
-                key = str(p.get("message_id") or p.get("message_seq") or "m")
+                key = self._part_key(p)
                 if key in self.parts:
                     self.parts[key] = ""
             elif name == "delta.message_done":
-                key = str(p.get("message_id") or p.get("message_seq") or "m")
+                key = self._part_key(p)
                 full = p.get("content") or p.get("display_text") or p.get("text")
                 if isinstance(full, str) and full.strip():
                     self.parts[key] = full
@@ -424,7 +463,13 @@ class Turn:
             if (e.get("seq") or 0) > (self.user_seq or 0) and e.get("event_name") == "message.assistant":
                 t = ev_text(e)
                 if t:
-                    texts[str(_payload(e).get("message_id") or e.get("seq"))] = t
+                    key = str(_payload(e).get("message_id") or e.get("seq"))
+                    texts[key] = t
+                    # keep live deltas for this message on the same parts key
+                    for field in ("message_id", "message_seq"):
+                        v = _payload(e).get(field)
+                        if v is not None:
+                            self._part_keys[str(v)] = key
         if texts:
             with self.lock:
                 if list(texts.values()) != list(self.parts.values()):
@@ -644,7 +689,10 @@ class Bot:
                 self.save_state()
 
     def session_busy(self, session_id):
-        return any(t.session_id == session_id and not t.finished for t in list(self.turns.values()))
+        # finished turns stay busy while finish_turn is delivering: the
+        # monitor must not forward the same reply in parallel.
+        return any(t.session_id == session_id and (not t.finished or t.delivering)
+                   for t in list(self.turns.values()))
 
     # -- telegram output ------------------------------------------------------
     def send(self, chat_id, text, markup=None, html=True, reply_to=None, silent=False):
@@ -719,6 +767,7 @@ class Bot:
     def media_key(self, chat_id, session_id, seq, r):
         # By path, not seq: a live delta.presentation carries its stream's own
         # counter, the history copy the chat seq; both must dedupe together.
+        # (seq, path) keying would send every file twice, once per view.)
         return f"{self.profile}|{chat_id}|{session_id or MAIN}|{r.get('path')}"
 
     def media_sent(self, chat_id, session_id, seq, r):
@@ -735,6 +784,20 @@ class Bot:
             del sent[:-500]
             self.save_state()
         return True
+
+    def release_media(self, chat_id, session_id, seq, r):
+        """Undo a claim whose delivery failed, so another path can retry it.
+
+        A claim is a reservation, not proof of delivery: keeping it after
+        a failed download/send suppressed the file forever (the monitor
+        and finish_turn both honour claims). Only the too-big path keeps
+        its claim: that file can never be sent, and its notice says so."""
+        key = self.media_key(chat_id, session_id, seq, r)
+        with self.lock:
+            sent = self.state.get("sent_media", [])
+            if key in sent:
+                sent.remove(key)
+                self.save_state()
 
     def prefetch(self, r):
         """Start downloading R now (concurrently); returns a future of its bytes."""
@@ -766,10 +829,11 @@ class Bot:
             return True
         t0 = time.time()
         try:
-            got = fetched.result() if fetched is not None else None
+            got = fetched.result(timeout=MEDIA_FETCH_WAIT) if fetched is not None else None
             data, dl = got if got else self._timed_download(r)
         except Exception as e:  # noqa: BLE001
             log.warning("media download failed seq=%s %s: %s", seq, name, str(e)[:200])
+            self.release_media(chat_id, session_id, seq, r)
             self.send(chat_id, f"📎 {esc(prefix)}Muse showed <b>{esc(what)}</b>, but I could not fetch it "
                                f"({esc(type(e).__name__)}). /files lists it for a retry.")
             return True
@@ -781,6 +845,7 @@ class Bot:
                      dl, t2 - t0, time.time() - t2)
         except Exception as e:  # noqa: BLE001
             log.warning("media send failed seq=%s %s: %s", seq, name, str(e)[:200])
+            self.release_media(chat_id, session_id, seq, r)
             self.send(chat_id, f"📎 {esc(prefix)}could not send <b>{esc(what)}</b> to Telegram "
                                f"({esc(str(e)[:150])}).")
         return True
@@ -811,7 +876,7 @@ class Bot:
         try:
             if fut is not None and not self.sync:
                 try:
-                    fut.result()      # wait for the bytes before touching the bubble
+                    fut.result(timeout=MEDIA_FETCH_WAIT)  # wait for the bytes before touching the bubble
                 except Exception:     # noqa: BLE001 - send_media reports it
                     pass
             with turn.edit_lock:
@@ -1219,6 +1284,14 @@ class Bot:
         self.finish_turn(turn, res)
 
     def finish_turn(self, turn, res):
+        """Deliver a finished turn; session_busy stays true throughout."""
+        turn.delivering = True
+        try:
+            self._finish_turn(turn, res)
+        finally:
+            turn.delivering = False
+
+    def _finish_turn(self, turn, res):
         chat_id = turn.chat_id
         outcome = res.get("outcome")
         text = "\n\n".join(r["text"] for r in res.get("replies") or [] if r.get("text")).strip()
@@ -1256,10 +1329,16 @@ class Bot:
             notes.append(f"⚠️ could not auto-approve {e.get('approval_id')}: {e.get('error')}")
         turn.wait_media()
         evs = self.turn_history(turn)
+        # Cap the watermark at what this turn delivered: the history window
+        # may already hold a later turn's events, which the monitor must
+        # still forward. The user's own message is the floor.
+        upto = max([turn.user_seq or 0]
+                   + [r.get("seq") or 0 for r in res.get("replies") or []]
+                   + [q for q, _r in media_from_events(evs, turn.user_seq or 0)] or [0])
         if turn.live_order:
             self.finish_split(turn, res, evs, notes, markup)
             turn.timing.mark("final_edit")
-            self.after_turn(turn, evs)
+            self.after_turn(turn, evs, upto=upto)
             return
         media = [(q, r) for q, r in media_from_events(evs, turn.user_seq or 0)
                  if not self.media_sent(chat_id, turn.session_id, q, r)]
@@ -1274,7 +1353,7 @@ class Bot:
         else:
             self.deliver_interleaved(turn, res.get("replies") or [], media, notes, markup, stem)
         turn.timing.mark("final_edit")
-        self.after_turn(turn, evs)
+        self.after_turn(turn, evs, upto=upto)
 
     def finish_split(self, turn, res, evs, notes, markup):
         """Final text when files already went out mid-turn: each reply goes in
@@ -1393,12 +1472,18 @@ class Bot:
         for i, piece in enumerate(pieces[1:], 1):
             self.send_md(chat_id, piece, markup if i == len(pieces) - 1 else None)
 
-    def after_turn(self, turn, evs=None):
+    def after_turn(self, turn, evs=None, upto=None):
         """Move the background watermark past the turn (its files went out
-        with the reply, in order; see finish_turn)."""
+        with the reply, in order; see finish_turn). UPTO caps the advance
+        at the last seq this turn delivered, so a later turn's events
+        already in the history window are not skipped. Call only after
+        delivery succeeded: finish_turn's paths raise before this on a
+        failed send, leaving the watermark for the monitor to catch up."""
         if evs is None:
             evs = self.turn_history(turn)
-        self.set_watermark(turn.session_id, max((e.get("seq") or 0 for e in evs), default=None))
+        seqs = [e.get("seq") or 0 for e in evs
+                if upto is None or (e.get("seq") or 0) <= upto]
+        self.set_watermark(turn.session_id, max(seqs, default=None))
 
     def _record_claim(self, claim, aid, decision, title, kind=None, scope=None):
         """Record a successful decide for a claim owned by this call.
@@ -2268,8 +2353,8 @@ class Bot:
             top = min(e.get("seq") or 0 for e in writing) - 1
             new = [e for e in new if (e.get("seq") or 0) <= top]
         media = media_from_events(evs, wm, top)
-        self.set_watermark(session_id, top)
         if not new and not media:
+            self.set_watermark(session_id, top)
             return
         chats = self.state["chats"].get(self.profile, {})
         targets = [int(c) for c, st in chats.items() if st.get("session_id") == session_id]
@@ -2292,6 +2377,9 @@ class Bot:
                 markup = None if here else keyboard([[button("Open this chat",
                                                              self.cb("open", session_id, title))]])
                 self.send_md(chat_id, f"💬 Muse · {title}:\n\n{text}", markup)
+        # Watermark only after every item went out: a failed send above
+        # raises, and the next check re-forwards from the old watermark.
+        self.set_watermark(session_id, top)
 
     def watch_event(self, ev):
         if not self.state.get("watch"):
@@ -2377,7 +2465,8 @@ class Monitor(threading.Thread):
         self.bot = bot
         self.session_id = session_id
         self.stop_ev = threading.Event()
-        self.dirty_at = 0.0       # check once at start (sets the watermark)
+        self.dirty_at = 0.0       # check once at start (sets the watermark); monotonic
+        self.last_progress = None  # monotonic time of the last scoped turn signal
         self.resumed = False      # after a drop: read further back in history
 
     def stop(self):
@@ -2398,24 +2487,39 @@ class Monitor(threading.Thread):
                 backoff = min(backoff * 2, 60)
                 continue
             backoff = 2
+            self.last_progress = time.monotonic()
             try:
                 body = {"capabilities": ["chat_cancel", "delta_stream"]}
                 if self.session_id:
                     body["session_id"] = self.session_id
-                gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9, idle_timeout=900,
-                                 overall_timeout=1800, on_record=self.on_record, should_stop=self.tick)
+                gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9, idle_timeout=MONITOR_IDLE,
+                                 overall_timeout=MONITOR_OVERALL, on_record=self.on_record, should_stop=self.tick)
             except ConnectionError as e:
                 # Dropped: resubscribe on the new connection and catch up on
                 # anything said meanwhile from history (watermark + dedupe).
                 log.info("monitor %s: connection dropped (%s); resubscribing", name, e)
                 self.resumed = True
-                self.dirty_at = time.time() - 1.5
+                self.dirty_at = time.monotonic() - 1.5
                 self.stop_ev.wait(0.5)
             except Exception as e:  # noqa: BLE001
                 log.warning("monitor %s: %s", name, e)
                 self.stop_ev.wait(backoff)
             finally:
                 gw.close()
+
+    def _scoped_progress(self, ev):
+        """True for a turn signal in this monitor's conversation.
+
+        Only message/delta/task/agent records scoped to this session count:
+        sessions.updated/tasks.updated arrive on every scoped subscribe and
+        say nothing about a turn, and keepalives carry no event at all."""
+        name = event_name(ev) or ""
+        if name in ("sessions.updated", "tasks.updated"):
+            return False
+        if not (name.startswith("message.") or name.startswith("delta.")
+                or name in ("task.status", "agent.status")):
+            return False
+        return in_scope(ev, self.session_id)
 
     def on_record(self, line):
         try:
@@ -2429,18 +2533,21 @@ class Monitor(threading.Thread):
                 self.bot.on_pending(pend)
             except Exception as e:  # noqa: BLE001
                 log.warning("approvals: %s", e)
-        status = str(_payload(ev).get("status") or "").lower()
-        if (name.startswith("message.") or name in ("delta.message_done", "delta.presentation",
-                                                     "sessions.updated")
-                or (name == "task.status" and status and status != "running")):
-            self.dirty_at = self.dirty_at or time.time()
+        if self._scoped_progress(ev):
+            now = time.monotonic()
+            self.last_progress = now
+            self.dirty_at = self.dirty_at or now
         self.bot.watch_event(ev)
         return self.stop_ev.is_set()
 
     def tick(self):
         if self.stop_ev.is_set():
             return True
-        if self.dirty_at is not None and time.time() - self.dirty_at > 1.5:
+        now = time.monotonic()
+        if self.last_progress is None:
+            self.last_progress = now
+        watchdog = now - self.last_progress > MONITOR_WATCHDOG
+        if (self.dirty_at is not None and now - self.dirty_at > 1.5) or watchdog:
             self.dirty_at = None
             limit, self.resumed = (60 if self.resumed else 15), False
             try:
@@ -2449,6 +2556,11 @@ class Monitor(threading.Thread):
                 pass
             except Exception as e:  # noqa: BLE001
                 log.warning("background check: %s", e)
+            if watchdog:
+                # No scoped progress for a minute: the stream may be deaf.
+                # End the subscribe so run() resubscribes; the check above
+                # already caught up anything said meanwhile.
+                return True
         try:
             self.bot.flush_watch()
         except Exception:  # noqa: BLE001
