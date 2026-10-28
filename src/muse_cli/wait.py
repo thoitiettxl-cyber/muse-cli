@@ -240,6 +240,9 @@ class Waiter:
         self.ignored_terminal = None
         self.ignored_reason = None  # "subagents" when the root terminal arrived
         # while subagents were still running: settle must not accept it.
+        self.ignored_terminal_seq = None  # seq of the ignored terminal record
+        # (None when the record carried no seq: accept_replayed_failed
+        # cannot prove the terminal belongs to the boundary turn then).
         self.root_id = None  # learned ONLY from a root-confirmed `running`
         # (a subagent's own task.status carries agent_id == its own
         # root_agent_id, a different root value: learning from any
@@ -317,6 +320,7 @@ class Waiter:
                     self.seen_running = True
                     self.ignored_terminal = None
                     self.ignored_reason = None
+                    self.ignored_terminal_seq = None
                     self.boundary_unknown = False
                     if self.running_seq is None:
                         self.running_seq = ev.get("seq")
@@ -333,12 +337,14 @@ class Waiter:
             # Root says done while subagents still run (muse01: a subagent
             # `completed` arrived 4.5 s before the root's): suspect, re-check.
             self.ignored_terminal = s
+            self.ignored_terminal_seq = ev.get("seq")
             self.ignored_reason = "subagents"
             return None
         if not info["root_confirmed"]:
             # Missing root id (absent, or a subagent id with no root id):
             # suspect, never a direct end. Settle decides with history.
             self.ignored_terminal = s
+            self.ignored_terminal_seq = ev.get("seq")
             self.ignored_reason = "missing_root"
             return None
         if s in DONE or s in FAILED:
@@ -346,10 +352,12 @@ class Waiter:
                 self.result = ("done" if s in DONE else "failed", s)
                 return self.result
             self.ignored_terminal = s
+            self.ignored_terminal_seq = ev.get("seq")
             self.ignored_reason = None
             return None
         # Suspect string (idle/done/failed/...): needs history proof.
         self.ignored_terminal = s
+        self.ignored_terminal_seq = ev.get("seq")
         self.ignored_reason = None
         return None
 
@@ -358,9 +366,10 @@ class Waiter:
         a reply to our message: the turn ran and ended before the
         subscription started, or under a suspect status string. Returns
         the result or None. The ignored terminal is cleared only on
-        success; `interrupted` never settles (a cancel needs no history
-        proof, and a replayed one must not end the wait), and a terminal
-        stored while subagents ran needs a re-check first."""
+        success; `interrupted` never settles here (a replayed FAILED
+        terminal is handled by accept_replayed_failed, which proves it
+        belongs to the boundary turn from the terminal's seq), and a
+        terminal stored while subagents ran needs a re-check first."""
         s = self.ignored_terminal
         if self.result is not None or not s:
             return None
@@ -375,7 +384,38 @@ class Waiter:
             return None
         self.ignored_terminal = None
         self.ignored_reason = None
+        self.ignored_terminal_seq = None
         self.result = ("failed" if s in SUSPECT_FAILED else "done", s)
+        return self.result
+
+    def accept_replayed_failed(self, latest_user_seq):
+        """Exit 2 for a replayed FAILED terminal that belongs to the
+        boundary turn: the wait started after a cancel, and the terminal
+        is the end of the turn after `after_seq`.
+
+        "Belongs to the boundary turn" is proved from evidence available
+        at wait start: the terminal was root-confirmed (ignored_reason is
+        None, so not missing-root/subagents-suspect), the boundary is
+        known, the terminal record carries a seq, and no message.user
+        event is newer than that seq (latest_user_seq <= terminal seq).
+        A FAILED terminal from an older turn (a newer user event exists,
+        or the terminal seq is unknown) must NOT exit 2: it returns None
+        and the wait keeps waiting for the live turn. SUSPECT_FAILED
+        strings are never accepted here (unmeasured vocabulary); they
+        stay on the settle path, which also refuses FAILED. Exits with
+        0 replies: a cancelled turn's partials are never final replies."""
+        s = self.ignored_terminal
+        if self.result is not None or not s or s not in FAILED:
+            return None
+        if self.boundary_unknown or self.ignored_reason is not None:
+            return None
+        tseq = self.ignored_terminal_seq
+        if tseq is None or latest_user_seq is None or latest_user_seq > tseq:
+            return None
+        self.ignored_terminal = None
+        self.ignored_reason = None
+        self.ignored_terminal_seq = None
+        self.result = ("failed", s)
         return self.result
 
 

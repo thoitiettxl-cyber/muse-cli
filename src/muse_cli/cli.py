@@ -1313,7 +1313,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
     the old one).
     """
     from .wait import (Waiter, replies_after, exit_code, outcome_of, needs_input_reason,
-                       question_of, in_scope)
+                       question_of, in_scope, FAILED)
     import logging
     import threading
     log = log or logging.getLogger("muse_cli.wait")
@@ -1378,6 +1378,41 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             if oldest <= after_seq:
                 return out
         return out
+
+    def latest_user_seq():
+        """Max message.user seq in a history window, or None when no user
+        event is found. The window grows exactly like history_replies
+        (200/500/1000 while has_more and the oldest event is still newer
+        than after_seq): a truncated window must not hide a newer user
+        event that would prove a FAILED terminal stale. Growth stops
+        once the window reaches after_seq, so the common case is one
+        read. A transport error propagates to the caller, which retries
+        on the next record; None is a proved answer (no user event in
+        the window), not a failure. Used only to prove a replayed FAILED
+        terminal belongs to the boundary turn (see
+        Waiter.accept_replayed_failed)."""
+        seen = None
+        for lim in HISTORY_LIMITS:
+            g = conn(cfg)
+            try:
+                budget = max(0.1, deadline - time.monotonic())
+                kw = {"body": {"limit": lim, **scope}, "timeout": budget}
+                if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                    kw["_deadline"] = time.monotonic() + budget
+                resp = g.call_json("chat.history", **kw)
+                evs = resp.get("chat_events", []) or []
+            finally:
+                g.close()
+            for e in evs:
+                if isinstance(e, dict) and e.get("event_name") == "message.user":
+                    s = e.get("seq") or 0
+                    seen = s if seen is None else max(seen, s)
+            if not resp.get("has_more") or not evs:
+                return seen
+            oldest = min((e.get("seq") or 0 for e in evs if isinstance(e, dict)), default=0)
+            if oldest <= after_seq:
+                return seen
+        return seen
 
     def derive_after_seq():
         """The boundary for a standalone wait: the last message.user seq
@@ -1487,10 +1522,19 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
                 # another terminal's proof).
                 pending = w.ignored_terminal if w.result is None else None
             if pending:
-                replies = history_replies()
-                with wlock:
-                    if w.result is None and w.ignored_terminal == pending:
-                        w.settle(replies)
+                if pending in FAILED:
+                    # Replayed FAILED terminal: prove it belongs to the
+                    # boundary turn from its seq (no replies are read: a
+                    # cancelled turn exits 2 with 0 replies).
+                    latest = latest_user_seq()
+                    with wlock:
+                        if w.result is None and w.ignored_terminal == pending:
+                            w.accept_replayed_failed(latest)
+                else:
+                    replies = history_replies()
+                    with wlock:
+                        if w.result is None and w.ignored_terminal == pending:
+                            w.settle(replies)
             if w.result is not None:
                 log.info("wait: periodic check: turn over (status %s)", w.status)
             info = task_status_info(ev, thread)
@@ -1557,6 +1601,26 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             # history fetch per record. A failed read retries on the next
             # record; a later terminal resets the flag above.
             settle_state["tried"] = True
+            if ignored in FAILED:
+                # A replayed FAILED terminal never settles with replies:
+                # prove it belongs to the boundary turn from its seq, and
+                # exit 2 with 0 replies. A FAILED terminal from an older
+                # turn keeps waiting for the live turn.
+                try:
+                    latest = latest_user_seq()
+                except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+                    log.debug("failed-terminal check failed: %s", e)
+                    settle_state["tried"] = False
+                    return False
+                with wlock:
+                    tseq = w.ignored_terminal_seq
+                    settled = (w.accept_replayed_failed(latest)
+                               if w.ignored_terminal == ignored else None)
+                if settled is not None:
+                    log.info("turn already failed (status %s, terminal seq %s)",
+                             w.status, tseq)
+                    return True
+                return False
             try:
                 replies = history_replies()
             except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
@@ -1633,6 +1697,20 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
             log.debug("wait: re-checking the server (%s; status %s)",
                       "requested" if forced[0] else "no events / stream ended", w.status)
     kind, detail = w.result or ("timeout", w.status)
+    if kind == "timeout" and w.ignored_terminal in FAILED:
+        # The wait ended (timeout or stop) with a replayed FAILED terminal
+        # still pending: one last proof attempt before reporting 124, so
+        # a standalone wait started after a cancel exits 2 here too.
+        # A read failure leaves the timeout standing.
+        try:
+            latest = latest_user_seq()
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            log.debug("failed-terminal check failed: %s", e)
+        else:
+            with wlock:
+                accepted = w.accept_replayed_failed(latest)
+            if accepted is not None:
+                kind, detail = accepted
     replies = []
     final_read_failed = False
     for _try in range(2):  # one bounded retry on the final history read
