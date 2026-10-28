@@ -183,19 +183,30 @@ muse-cli redeem <CODE>                # redeem a friend's invite code: one-time,
   replaces a dead connection and resubscribes (each wait-path connect capped
   at 30 s, CLI wait path only — the Telegram follower uses the 60 s default
   cap; a reconnect storm switches to one bounded state check after 30 s),
-  and checks the turn state on the server only
-  when a gap is suspected (20 s without scoped progress, 8 s budget), so a
-  turn that ended while the stream was deaf is reported at once with its
-  final replies. A live terminal after `running` ends a turn at once with no
-  history proof (a replayed or suspect terminal needs history proof);
+  and checks the turn state on the server on a cadence, not only
+  when a gap is suspected: every 60 s an unconditional safety-net state
+  check runs on a separate short subscription (8 s budget) even on a
+  healthy stream, and every 20 s without scoped progress the stream is
+  ended and resubscribed, which replays the current state and
+  re-settles (a mid-turn state re-read, not a no-op); the watchdog
+  (20 s without scoped progress) and the reconnect-storm switch are
+  additional triggers, so a turn that ended while the stream was deaf
+  is reported at once with its final replies. A live terminal after
+  `running` ends a turn at once with no history proof (a replayed
+  `completed` or suspect terminal needs history proof);
   `interrupted` after `running` exits 2 with no history proof;
   `cancelled`/`canceled` are retained from the pre-existing cancel flow, not
-  live-measured, and a standalone wait started after a cancel times out
-  instead of exiting 2. Approvals carry no session id, so auto-approve may
+  live-measured. A standalone wait started after a cancel exits 2 when
+  the replayed FAILED terminal is proved to belong to the boundary turn
+  (root-confirmed, terminal seq present, no newer user event); when the
+  proof fails it times out (124) instead. Approvals carry no session id, so auto-approve may
   decide an approval Muse did not scope to this session.
   Reconnects are quiet; only after about a minute without Muse does stderr
   get one `wait: can't reach Muse`
-  line (and `wait: reconnected` when it is back). Exit codes are unchanged.
+  line (and `wait: reconnected` when it is back). Exit codes are 0/2/4/124
+  as listed below; the replayed-FAILED exit 2 above is the 0.6.0
+  behaviour, restored — a wait that cannot prove the terminal belongs
+  to the boundary turn still reports 124.
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
   `4` needs a human: a question in the final reply (widget or plain text,

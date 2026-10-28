@@ -54,9 +54,13 @@ chat / feed / goals / ideas / sessions / ...
   it; `session_id` scopes to a side chat; `limit` works. History events use
   `event_name` (`message.user` / `message.assistant`), carry the text in both
   top-level and `payload.display_text`, and are the source of truth.
-- Genuine assistant replies have an **empty `reply_to_message_id`**; proactive
-  pushes (Telegram drafts, background task updates) are self-referential
-  there. That is how `send` tells a reply apart from background chatter.
+- Genuine assistant replies may carry a `reply_to_message_id` pointing at
+  the message they answer; proactive pushes (Telegram drafts, background
+  task updates) are self-referential there: `reply_to_message_id` equals
+  the message's own `message_id` (at the event or the payload level).
+  Only that exact match drops a reply — an empty `reply_to_message_id`
+  is not required. That is how `send` tells a reply apart from
+  background chatter.
 - Live `chat.subscribe` events use **different shapes** (`delta.text_append`
   with `message_seq` + text chunks, `delta.message_done` with the full
   transcript) and only cover main-chat traffic: threaded replies never arrive
@@ -183,8 +187,8 @@ not measured is marked unresolved.
 |---|---|
 | `completed`, root agent, `running` seen first | DONE (exit 0) AT ONCE, no history proof: a live terminal after running ends the wait; the final replies are re-read from history afterwards |
 | `interrupted`, root agent, `running` seen first | FAILED (exit 2); no history proof required |
-| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; never accepted from a replay |
-| `completed`/`interrupted`/any terminal replayed BEFORE `running` was seen in this wait | Suspect: stored, settled against history (below); never ends the wait alone |
+| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; accepted from a replay only via the boundary-turn proof (`accept_replayed_failed`), never from a replay without it |
+| `completed`/`interrupted`/any terminal replayed BEFORE `running` was seen in this wait | Suspect: stored, settled against history (below); a replayed `completed` never ends the wait alone, and a replayed FAILED ends it only via the boundary-turn proof |
 | Terminal with a missing `root_agent_id` (absent, or a subagent id with no root id) | Suspect IN CODE, never a direct end — even after `running` was seen; settled against history only. The root id is learned ONLY from a root-confirmed `running` (a subagent's own `task.status` carries `agent_id == root_agent_id` with a DIFFERENT root value) |
 | `running`, root agent only | The only in-progress value; the only value that may set `seen_running` |
 | `pending_init` | Suspect, never progress, for any agent |
@@ -197,16 +201,22 @@ a missing root id makes the event suspect IN CODE (see the table). `sessions.upd
 `tasks.updated` arrive on scoped subscribes and must never count as
 progress; scope-check every event kind by `session_id` when present.
 A fresh subscribe replays the last terminal state (`completed` on a fresh
-thread, `interrupted` after a cancel): a replay terminal alone never ends
-a wait — it needs `running` seen in this wait first, or history proof via
-settle. Settle never accepts FAILED: a standalone wait started AFTER a
-cancel times out (124) instead of exiting 2 — known limitation.
+thread, `interrupted` after a cancel): a replayed `completed` terminal
+alone never ends a wait — it needs `running` seen in this wait first, or
+history proof via settle. Settle never accepts FAILED; instead a
+replayed FAILED terminal exits 2 via `accept_replayed_failed` when it is
+proved to belong to the boundary turn (root-confirmed, boundary known,
+terminal seq present, no `message.user` event newer than the terminal
+seq). When that proof fails — no seq, a newer user event, or a missing
+root id — the wait times out (124) instead of exiting 2.
 
 ### History settle
 
 A history event counts as a delivered reply only if ALL hold:
 `event_name = message.assistant`, `payload.status` exactly `completed`,
-`reply_to_message_id` empty at BOTH the event and the payload level,
+`reply_to_message_id` (event or payload level) NOT equal to the
+message's own `message_id` (a self-referential event is a proactive push;
+a `reply_to` pointing at another id is kept),
 `seq > after_seq`, `seq <=` the upper bound captured at terminal /
 state-check time. Dedup by (`seq`, `message_id`). `interrupted`-status
 assistant events are partials (two observed, 1998/2464 chars) and are
@@ -282,7 +292,9 @@ auto-approve may decide an approval Muse did not scope to this session.
 Expired-but-listed approvals are ignored (the waiter filters by
 `request_expires_at_ms`): a clock running ahead hides them — known
 limitation, no surfacing. A standalone wait started after a cancel
-times out (124) instead of exiting 2 (settle never accepts FAILED).
+exits 2 only when the replayed FAILED terminal is proved to belong to
+the boundary turn (see the replay paragraph above); when the proof
+fails it times out (124).
 Watermark granularity: a partially delivered batch retried by the
 monitor can duplicate the delivered part (per-item watermarking is a
 follow-up, not implemented). Same-path media in different turns can
@@ -311,7 +323,16 @@ follows. The connect itself moved out from under `shared_lock` in `live()` so a 
 handshake cannot serialise other threads, a storm of failed resubscribes
 switches to one bounded state check after 30 s, and resubscribe backoff
 sleeps are capped by the remaining caller deadline; heartbeat 25 s;
-state check only on a suspected gap; final history read floored at 5 s;
+server checks run on a cadence, NOT only on suspicion: every 60 s
+(`CHECK_EVERY`) an unconditional safety-net state check runs on a
+separate short subscription (8 s budget) even on a healthy stream, and
+every 20 s without scoped progress (`RECHECK_AFTER`) the stream is
+ended and resubscribed, which replays the current state and re-settles
+(a mid-turn state re-read, not a no-op); the watchdog (20 s without
+scoped progress) and the reconnect-storm switch are additional
+triggers. A resubscribe mid-turn is a state re-read: the server replays
+the current `task.status` and settle is retried; final history read
+floored at 5 s;
 lag window ~2 s after an empty `done` final read.
 Hang bound (CLI wait path only; the Telegram follower's Bot Muse uses
 the 60 s default connect cap, so this bound does not cover bot
@@ -324,6 +345,12 @@ from silence to report is watchdog 20 s + reconnect 30 s + final 7 s
 = 57 s, comfortably inside the 90 s Floor (this is the claimed Floor
 reading); the elapsed wall-time bound including close (87 s typical /
 96 s pathological) is NOT claimed to be inside the 90 s Floor. The
+reconnect-storm state check (8 s budget, synchronous in the wait loop
+via `note_failure`) runs before the caller deadline in the normal case
+and adds nothing to that overshoot; in the pathological case where it
+starts just before the deadline it can add up to 8 s to the elapsed
+overshoot (up to 104 s on timeouts longer than 30 s — unreachable on a
+20 s harness, where the storm switch cannot fire before the deadline). The
 35 s Target is unreachable by design (one hung connect alone can
 consume 30 s). Concurrent state checks do not delay the return, and
 backoff cannot overshoot the deadline.
@@ -333,3 +360,14 @@ cite the pre-fix exiting-subset numbers (median 0.469 s, p95 0.541 s,
 N=11) for the fixed code. The post-fix live evidence is 20/20 exit +
 exact replies on split send+wait — after_seq-fix evidence only, not a
 latency measurement.
+
+AuthError propagation (closed hazard): `AuthError` is a `RuntimeError`
+raised by the gateway on expired cookies. It is re-raised by `_run_wait`
+before the catch-all that reports unexpected failures as 124, so it
+reaches `main()` (exit 2, "auth error") and the Telegram turn caller's
+`AuthError` branch ("login expired, send /login"). Before this fix the
+catch-all swallowed it as 124, and any agent following "124 -> retry"
+looped forever on expired cookies; the Telegram login-expired branch
+was unreachable through a wait. `KeyboardInterrupt`/`SystemExit` were
+never caught (`except Exception` does not catch `BaseException`) and
+stay uncaught.
