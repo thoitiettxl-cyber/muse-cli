@@ -86,7 +86,15 @@ def test_derive_retries_once_then_excludes_stale_reply(monkeypatch):
                  {"seq": AFTER, "event_name": "message.user",
                   "payload": {"display_text": "hi"}}]
     w.state = "completed"
-    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0)
+    # FakeGW ignores subscribe overall_timeout, so the run() safety
+    # should_stop (timeout+5) would bound these derive tests at 7 s.
+    # Bound explicitly just past the caller deadline instead (same
+    # technique in the other two derive tests below): the fake's
+    # subscribe returns at the bound and the outer loop exits on the
+    # expired deadline. Assertions are unchanged.
+    t0 = time.monotonic()
+    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0,
+                         should_stop=lambda: time.monotonic() > t0 + 2.3)
     assert code == 124
     assert res["replies"] == []
     assert res["after_seq"] == AFTER
@@ -116,7 +124,9 @@ def test_derive_window_exhaustion_uses_seen_max(monkeypatch):
                   "payload": {"display_text": "old", "message_id": "m9",
                               "status": "completed"}}]
     w.state = "completed"
-    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0)
+    t0 = time.monotonic()
+    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0,
+                         should_stop=lambda: time.monotonic() > t0 + 2.3)
     assert code == 124
     assert res["after_seq"] == 9000
     assert res["replies"] == []
@@ -157,7 +167,9 @@ def test_derive_all_reads_failing_disables_replay_settle(monkeypatch):
                   "payload": {"display_text": "STALE", "message_id": "m1",
                               "status": "completed"}}]
     w.state = "completed"
-    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0)
+    t0 = time.monotonic()
+    (code, res), _ = run(w, after_seq=None, timeout=2, check_every=0,
+                         should_stop=lambda: time.monotonic() > t0 + 2.3)
     assert code == 124
     assert res["replies"] == []
     assert res["after_seq"] == 0

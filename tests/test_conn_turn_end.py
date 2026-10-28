@@ -229,14 +229,14 @@ def test_bounded_connect_never_returns_a_closed_gateway():
                 closed.append(1)
 
         def slow(cfg, _closed=closed):
-            time.sleep(0.03)
+            time.sleep(0.01)
             return GW()
         try:
-            gw = conn.bounded_connect(slow, {}, timeout=0.03)
+            gw = conn.bounded_connect(slow, {}, timeout=0.01)
             results.append(("ok", gw, closed))
         except TimeoutError:
             results.append(("timeout", None, closed))
-        time.sleep(0.06)  # let the worker finish / close
+        time.sleep(0.03)  # let the worker finish / close (3x the connect time)
     for kind, gw, closed in results:
         if kind == "ok":
             assert closed == [], "claimed gateway was closed by the worker"
@@ -445,7 +445,10 @@ def test_heartbeat_stop_during_tick_exits_old_thread(monkeypatch):
 
     def blocking_tick(interval):
         entered.set()
-        gate.wait(5)
+        # The tick blocks well past the stop; 1.5 s keeps the join-while-
+        # blocked path exercised (stop joins up to 6 s) without paying
+        # the old 5 s gate wait.
+        gate.wait(1.5)
 
     muse = conn.Muse(connector=lambda cfg: None)
     monkeypatch.setattr(muse, "_hb_tick", blocking_tick)

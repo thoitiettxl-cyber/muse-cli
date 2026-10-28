@@ -77,7 +77,9 @@ def test_no_user_event_falls_back_to_zero_boundary(world):
 class SlowHistoryGW(FakeGW):
     def call_json(self, method, body=None, **kw):
         if method == "chat.history":
-            time.sleep(1.5)
+            # A read slower than the resubscribe cadence (0.05 s) must not
+            # hang the wait; 0.75 s keeps 15x margin over the cadence.
+            time.sleep(0.75)
         return super().call_json(method, body, **kw)
 
 
@@ -103,8 +105,11 @@ def test_slow_history_does_not_hang_the_wait(monkeypatch):
 class HungCheckGW(FakeGW):
     def subscribe_raw(self, method, body=None, max_records=100, on_record=None,
                       should_stop=None, **kw):
-        if max_records == 50:  # task_state(): hang far past the check cadence
-            time.sleep(3)
+        if max_records == 50:  # task_state(): hang past the check cadence
+            # 1 s is 3x the 0.3 s cadence, so checks overlap; the sleep
+            # happens before the fake records the subscribe, so a longer
+            # hang would outlive the test's own bound and register 0.
+            time.sleep(1)
             return super().subscribe_raw(method, body, max_records, on_record,
                                          should_stop, **kw)
         return super().subscribe_raw(method, body, max_records, on_record,
@@ -127,7 +132,15 @@ def test_hung_state_check_does_not_suppress_later_checks(monkeypatch):
     monkeypatch.setattr(cli, "RESUB_PAUSE", 0.05)
     monkeypatch.setattr(conn.Muse, "HEARTBEAT", 0.2)
     w.state = "running"
-    (code, _res), secs = run(w, timeout=3, check_every=0.3, recheck_after=0)
+    # FakeGW ignores subscribe overall_timeout, so the run() safety
+    # should_stop (timeout+5) would bound this test at 8 s. Bound it
+    # explicitly just past the caller deadline instead: the fake's
+    # subscribe returns at the bound, the outer loop sees the expired
+    # deadline and exits. The assertions (code, check count) are
+    # unchanged; only the harness safety slack shrinks.
+    t0 = time.monotonic()
+    (code, _res), secs = run(w, timeout=3, check_every=0.3, recheck_after=0,
+                             should_stop=lambda: time.monotonic() > t0 + 3.3)
     assert code == 124
     checks = [m for _n, m in w.subscribes if m == 50]
     assert len(checks) >= 3
@@ -155,10 +168,23 @@ class StormWorld(World):
         return g
 
 
+def test_reconnect_budget_value_is_30_seconds():
+    """Pin: the production reconnect-storm budget is 30 s. The storm test
+    below scales it down via monkeypatch to keep the suite fast; the
+    mechanism (switch after the budget, one bounded check) is proved
+    there, the value here."""
+    assert cli.RECONNECT_BUDGET == 30
+
+
 def test_reconnect_storm_ends_via_state_check_within_budget(monkeypatch):
-    """Thirty seconds of failed resubscribes must trigger a bounded state
-    check, which settles the already-finished turn instead of storming
-    until the caller's timeout."""
+    """Failed resubscribes past the reconnect budget must trigger a
+    bounded state check, which settles the already-finished turn instead
+    of storming until the caller's timeout. The budget is scaled to 3 s
+    via monkeypatch (the production value, 30 s, is pinned by
+    test_reconnect_budget_value_is_30_seconds): the switch logic reads
+    the module constant, so scaling it scales the behaviour identically
+    without weakening the assertion."""
+    monkeypatch.setattr(cli, "RECONNECT_BUDGET", 3)
     w = StormWorld()
     monkeypatch.setattr(cli, "connect", w.connect)
     monkeypatch.setattr(cli, "RESUB_PAUSE", 0.05)
@@ -167,7 +193,7 @@ def test_reconnect_storm_ends_via_state_check_within_budget(monkeypatch):
     w.reply(AFTER + 1, "Done in the storm.")
     (code, res), secs = run(w, timeout=120)
     assert code == 0 and [r["text"] for r in res["replies"]] == ["Done in the storm."]
-    assert secs < 45
+    assert secs < 15
 
 
 class FlakyGW(FakeGW):

@@ -153,7 +153,11 @@ def test_replayed_interrupted_from_older_turn_does_not_exit_2(world, monkeypatch
                   "payload": {"display_text": "new turn"}}]
     w.state = "interrupted"
     w.term_seq = AFTER + 1  # terminal before the newer user message
-    (code, res), secs = run(w, timeout=2, check_every=0)
+    # Bound explicitly just past the deadline: FakeGW ignores subscribe
+    # overall_timeout, so the run() safety stop (timeout+5) would cost 7 s.
+    t0 = time.monotonic()
+    (code, res), secs = run(w, timeout=2, check_every=0,
+                            should_stop=lambda: time.monotonic() > t0 + 2.3)
     assert code == 124
     assert secs >= 1.5
 
@@ -217,7 +221,9 @@ def test_replayed_failed_with_missing_root_id_does_not_exit_2(world, monkeypatch
                 return []
             time.sleep(0.02)
     monkeypatch.setattr(ReplayGW, "subscribe_raw", no_root_subscribe)
-    (code, _res), _ = run(w, timeout=2, check_every=0)
+    t0 = time.monotonic()
+    (code, _res), _ = run(w, timeout=2, check_every=0,
+                          should_stop=lambda: time.monotonic() > t0 + 2.3)
     assert code == 124
 
 
