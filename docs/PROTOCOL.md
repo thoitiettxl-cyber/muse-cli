@@ -295,6 +295,14 @@ limitation, no surfacing. A standalone wait started after a cancel
 exits 2 only when the replayed FAILED terminal is proved to belong to
 the boundary turn (see the replay paragraph above); when the proof
 fails it times out (124).
+Monitor forwarding delay: `sessions.updated` never counts as scoped
+progress (pinned by test_monitor_scoped_progress_and_watchdog — the
+records arrive on scoped subscribes for other sessions too, and the
+payload key that would scope them is unmeasured), so a change
+signalled only by `sessions.updated` is forwarded only when the
+60 s monitor watchdog fires (which runs a history catch-up check) or
+the next scoped turn signal arrives: worst case ~60 s + one history
+read, by code reading (`MONITOR_WATCHDOG=60`, `Monitor.tick`).
 Watermark granularity: a partially delivered batch retried by the
 monitor can duplicate the delivered part (per-item watermarking is a
 follow-up, not implemented). Same-path media in different turns can
