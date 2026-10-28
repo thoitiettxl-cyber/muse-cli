@@ -929,16 +929,22 @@ def cmd_download(args):
 def is_reply(ev, baseline):
     """True for a genuine assistant reply (not a proactive push).
 
-    In history, genuine replies are message.assistant events with an empty
-    reply_to_message_id; proactive pushes (Telegram drafts, background task
-    updates) are self-referential there.
-    """
+    Proactive pushes (Telegram drafts, background task updates) are
+    self-referential: reply_to_message_id equals the message's own id.
+    A genuine reply may carry reply_to pointing at the message it
+    answers, so only an exact match drops it — the same rule as
+    replies_after (see wait.is_self_referential, pinned by test
+    test_is_reply_agrees_with_replies_after). Note: is_reply is
+    currently uncalled in src (only a comment in chat.py references
+    it); it is kept, fixed, and tested so the two reply filters cannot
+    drift apart silently."""
     if ev.get("event_name") != "message.assistant":
         return False
     if (ev.get("seq") or 0) <= baseline:
         return False
     p = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
-    if (ev.get("reply_to_message_id") or p.get("reply_to_message_id")):
+    from .wait import is_self_referential
+    if is_self_referential(ev)[0]:
         return False
     if not (p.get("display_text") or p.get("content")):
         return False

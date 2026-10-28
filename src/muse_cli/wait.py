@@ -419,16 +419,40 @@ class Waiter:
         return self.result
 
 
+def is_self_referential(ev):
+    """Return (True, level, matched_id) when the event's reply_to_message_id
+    (event level or payload level) equals the message's OWN id, or
+    (False, None, None) otherwise.
+
+    Only an exact match proves a proactive push: the push's reply_to
+    points at itself. A genuine reply carries reply_to pointing at the
+    message it answers (a user message, or another assistant message),
+    and must be kept. When the event and payload ids differ, a match to
+    either own id drops it. When no id exists at either level,
+    self-reference cannot be proved and the event is kept (fail open).
+    No payload field beyond the evidenced message_id /
+    reply_to_message_id is read here."""
+    p = _payload(ev)
+    own = [mid for mid in (p.get("message_id"), ev.get("message_id")) if mid]
+    for level, ref in (("event", ev.get("reply_to_message_id")),
+                       ("payload", p.get("reply_to_message_id"))):
+        if ref and ref in own:
+            return True, level, ref
+    return False, None, None
+
+
 def replies_after(events, after_seq, upto=None):
     """Complete assistant messages with seq > after_seq (and <= UPTO when
     given), oldest first, deduped by (seq, message_id).
 
-    Only `completed` message.assistant events with an empty
-    reply_to_message_id at both the event and payload level count: an
-    event still being written has no status, an `interrupted` one is a
-    partial, and a self-referential reply_to marks a proactive push, not
-    a reply to our message. Entries with no text are kept when they carry
-    media or an unanswered widget (media=True)."""
+    Only `completed` message.assistant events count: an event still
+    being written has no status, an `interrupted` one is a partial, and
+    a self-referential event (reply_to_message_id equal to the
+    message's own message_id, at either level) is a proactive push, not
+    a reply to our message. A reply_to pointing at another id (the user
+    message it answers, or another assistant message) is kept. Entries
+    with no text are kept when they carry media or an unanswered widget
+    (media=True)."""
     out = []
     seen = set()
     dropped = []
@@ -448,7 +472,12 @@ def replies_after(events, after_seq, upto=None):
             if p.get("display_text") or p.get("content") or e.get("display_text"):
                 dropped.append(seq)
             continue
-        if e.get("reply_to_message_id") or p.get("reply_to_message_id"):
+        self_ref, level, matched = is_self_referential(e)
+        if self_ref:
+            # A proactive push points at itself; a genuine reply points
+            # at another id and is kept. Drops are logged, never silent.
+            log.debug("replies_after: dropping self-referential push seq=%s "
+                      "level=%s reply_to=%r", seq, level, matched)
             continue
         mid = p.get("message_id") or e.get("message_id")
         if (seq, mid) in seen:
