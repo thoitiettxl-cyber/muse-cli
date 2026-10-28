@@ -21,6 +21,7 @@ DOWNLOAD_LIMIT = 20 * 1024 * 1024  # bots may fetch up to 20 MB
 PHOTO_LIMIT = 10 * 1024 * 1024     # sendPhoto takes photos up to 10 MB
 SEND_METHODS = {"document": "sendDocument", "photo": "sendPhoto", "video": "sendVideo",
                 "audio": "sendAudio"}
+_POST_GRACE = 10           # slack past the HTTP timeout for a pooled worker to return
 
 
 class TelegramError(RuntimeError):
@@ -88,7 +89,10 @@ class TelegramAPI:
                 from concurrent.futures import ThreadPoolExecutor
                 self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg-http",
                                                 initializer=self._register_thread)
-        return self._pool.submit(self._post_now, method, timeout, **kw).result()
+        # Bounded: a hung worker cannot hold the caller past the HTTP
+        # timeout plus scheduling grace (raises TimeoutError).
+        return self._pool.submit(self._post_now, method, timeout, **kw).result(
+            timeout=timeout + _POST_GRACE)
 
     def _register_thread(self):
         self._pool_threads.add(threading.current_thread().ident)

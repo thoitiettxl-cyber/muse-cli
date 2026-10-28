@@ -38,8 +38,11 @@ def ts(status):
 
 
 def reply(seq, text):
+    # payload.status="completed": on muse01 every delivered assistant reply
+    # in history carries it, and the D4 settle rule accepts only that exact
+    # status (a statusless event is not proof of completion).
     return {"seq": seq, "event_name": "message.assistant",
-            "payload": {"display_text": text, "message_id": f"m{seq}"}}
+            "payload": {"display_text": text, "message_id": f"m{seq}", "status": "completed"}}
 
 
 class FakeGateway:

@@ -94,6 +94,28 @@ def join_chunks(partial, ntf):
 
 
 HANDSHAKE_TIMEOUT = 20   # seconds for the server's Noise handshake reply
+WRITE_DEADLINE = 15      # seconds for one _write to make progress or fail
+
+
+def _send_bytes_bounded(ws, data, timeout):
+    """ws.send_bytes with a bound: a server that accepts the socket and
+    then stops reading must not hang the handshake forever. A late
+    finish after the timeout finds the socket closed by the caller."""
+    box = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            ws.send_bytes(data)
+        except BaseException as e:  # noqa: BLE001 - handed to the caller
+            box["err"] = e
+        done.set()
+    t = threading.Thread(target=run, daemon=True, name="muse-hs-send")
+    t.start()
+    if not done.wait(timeout):
+        raise TimeoutError(f"gateway handshake send: no progress in {timeout:.0f}s")
+    if "err" in box:
+        raise box["err"]
 
 
 class ConnectionDown(ConnectionError):
@@ -384,12 +406,20 @@ class Gateway:
         noise.set_as_initiator()
         noise.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))
         noise.start_handshake()
-        self.ws.send_bytes(bytes(noise.write_message(b"")))
-        # WebSocket.recv() waits forever: a server that accepts the socket and
-        # then goes silent would hang this connect (and `muse-cli wait`) for good.
-        m2 = self._recv_handshake(HANDSHAKE_TIMEOUT)
-        noise.read_message(bytes(m2))
-        self.ws.send_bytes(bytes(noise.write_message(b"")))
+        try:
+            _send_bytes_bounded(self.ws, bytes(noise.write_message(b"")), HANDSHAKE_TIMEOUT)
+            # WebSocket.recv() waits forever: a server that accepts the socket
+            # and then goes silent would hang this connect (and `muse-cli
+            # wait`) for good.
+            m2 = self._recv_handshake(HANDSHAKE_TIMEOUT)
+            noise.read_message(bytes(m2))
+            _send_bytes_bounded(self.ws, bytes(noise.write_message(b"")), HANDSHAKE_TIMEOUT)
+        except Exception:
+            try:
+                self.ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         assert noise.handshake_finished
         self.noise = noise
         self.stream = 1
@@ -403,6 +433,8 @@ class Gateway:
         self.dead = None    # the exception that killed the reader, if any
         self.last_used = time.time()
         self.last_recv = time.time()   # last frame from the server (heartbeat: silent death)
+        self.last_used_mono = time.monotonic()
+        self.last_recv_mono = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name="muse-gw-reader")
         self._reader.start()
 
@@ -412,7 +444,7 @@ class Gateway:
         from curl_cffi.curl import CurlError
         from select import select
         sock = self.ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         chunks = []
         while True:
             try:
@@ -421,7 +453,7 @@ class Gateway:
                 if e.code != CurlECode.AGAIN:
                     self.ws.close()
                     raise ConnectionError(f"gateway handshake failed: {e}") from None
-                left = deadline - time.time()
+                left = deadline - time.monotonic()
                 if left <= 0:
                     self.ws.close()
                     raise TimeoutError(f"gateway handshake: no answer in {timeout:.0f}s")
@@ -441,7 +473,13 @@ class Gateway:
         return not self.closed and self.dead is None
 
     # -- low-level framing -------------------------------------------------
-    def _write(self, data):
+    def _write(self, data, timeout=WRITE_DEADLINE):
+        """Send DATA with one total monotonic deadline.
+
+        A 0-byte send or an AGAIN that never clears backs off instead of
+        spinning: each no-progress iteration sleeps a growing backoff
+        (10-100 ms) and re-checks the deadline, so a socket that accepts
+        nothing fails within TIMEOUT instead of hanging the writer."""
         if getattr(self, "_io_lock", None) is None:     # bare objects in tests
             self.ws.send_bytes(data)
             return
@@ -449,8 +487,12 @@ class Gateway:
         from curl_cffi.curl import CurlError
         from select import select
         sock = self.ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+        deadline = time.monotonic() + timeout
+        backoff = 0.01
         off = 0
         while off < len(data):
+            if time.monotonic() >= deadline:
+                raise ConnectionError("gateway send timed out")
             n = None
             with self._io_lock:
                 try:
@@ -458,12 +500,19 @@ class Gateway:
                 except CurlError as e:
                     if e.code != CurlECode.AGAIN:
                         raise ConnectionError(f"gateway send failed: {e}") from None
-            if n is None:
-                _r, w, _x = select([], [sock], [], 5)
-                if not w:
-                    raise ConnectionError("gateway send timed out")
+            if n:
+                off += n
+                backoff = 0.01
                 continue
-            off += n
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError("gateway send timed out")
+            try:
+                select([], [sock], [], min(remaining, 0.5))
+            except (OSError, ValueError):
+                pass  # no usable socket (fakes): back off, the deadline still binds
+            time.sleep(min(backoff, remaining))
+            backoff = min(backoff * 2, 0.1)
 
     def _recv_message(self):
         """One complete websocket message (reader thread only)."""
@@ -532,6 +581,7 @@ class Gateway:
             while not self.closed:
                 sf = self._read_frame()
                 self.last_recv = time.time()
+                self.last_recv_mono = time.monotonic()
                 with self._streams_lock:
                     q = self._streams.get(sf.stream_id)
                 if q is not None:
@@ -573,6 +623,7 @@ class Gateway:
         frame = ServiceFrame(stream_id=sid)
         frame.request.CopyFrom(req)
         self.last_used = time.time()
+        self.last_used_mono = time.monotonic()
         try:
             self._send_envelope(SERVICE_IDS.get(route.get("service", "daemon"), 0),
                                 frame.SerializeToString())
@@ -615,11 +666,11 @@ class Gateway:
         if route["http"] == "GET" and body is not None and query is None:
             query, body = body, None
         sid = self._open(method, path_params, body, query, route=route)
-        status, chunks, deadline = None, [], time.time() + timeout
+        status, chunks, deadline = None, [], time.monotonic() + timeout
         ended = False
         try:
             while True:
-                left = deadline - time.time()
+                left = deadline - time.monotonic()
                 if left <= 0:
                     break
                 try:
@@ -703,21 +754,21 @@ class Gateway:
         if on_open is not None:
             on_open()
         buf, records = b"", []
-        deadline = time.time() + overall_timeout
-        idle = time.time() + idle_timeout
+        deadline = time.monotonic() + overall_timeout
+        idle = time.monotonic() + idle_timeout
         halted = ended = False
         try:
-            while not halted and time.time() < deadline and len(records) < max_records:
+            while not halted and time.monotonic() < deadline and len(records) < max_records:
                 if should_stop is not None and should_stop():
                     halted = True
                     break
                 try:
                     sf = self._next(sid, 0.5)
                 except queue_mod.Empty:
-                    if time.time() > idle:
+                    if time.monotonic() > idle:
                         break
                     continue
-                idle = time.time() + idle_timeout
+                idle = time.monotonic() + idle_timeout
                 kind = sf.WhichOneof("kind")
                 if kind == "response":
                     if sf.response.body:
@@ -769,11 +820,27 @@ class Gateway:
         reader = getattr(self, "_reader", None)
         if reader is not None and reader is not threading.current_thread():
             reader.join(timeout=1)     # it notices `closed` within 0.25 s
-        try:
-            with getattr(self, "_io_lock", threading.Lock()):
+        lock = getattr(self, "_io_lock", None)
+        if lock is None:
+            try:
                 self.ws.close()
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # A wedged _write/_recv holding the I/O lock must not hang close:
+        # wait 2 s for the lock, then close the socket anyway.
+        if lock.acquire(timeout=2):
+            try:
+                self.ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                lock.release()
+        else:
+            try:
+                self.ws.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def lease(self):
         """This connection for code that calls close() when done: close() on

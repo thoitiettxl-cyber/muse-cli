@@ -54,9 +54,17 @@ chat / feed / goals / ideas / sessions / ...
   it; `session_id` scopes to a side chat; `limit` works. History events use
   `event_name` (`message.user` / `message.assistant`), carry the text in both
   top-level and `payload.display_text`, and are the source of truth.
-- Genuine assistant replies have an **empty `reply_to_message_id`**; proactive
-  pushes (Telegram drafts, background task updates) are self-referential
-  there. That is how `send` tells a reply apart from background chatter.
+- Genuine assistant replies may carry a `reply_to_message_id` pointing at
+  the message they answer; proactive pushes (Telegram drafts, background
+  task updates) are self-referential there: `reply_to_message_id` (at the
+  event or the payload level) equals the message's own id. Observed live,
+  that id is the bare execution id: `message_id` is
+  `assistant-msg-<execution id>` and `reply_to_message_id` is
+  `<execution id>`, or `payload.metadata.root_message_execution_id` for
+  the 2nd+ message of one push (never the literal `message_id`).
+  Only such a self-reference drops a reply — an empty `reply_to_message_id`
+  is not required. That is how `send` tells a reply apart from
+  background chatter.
 - Live `chat.subscribe` events use **different shapes** (`delta.text_append`
   with `message_seq` + text chunks, `delta.message_done` with the full
   transcript) and only cover main-chat traffic: threaded replies never arrive
@@ -149,8 +157,11 @@ reads in 4 MiB windows until `eof` and writes in 4 MiB append chunks.
 Live `chat.subscribe` replays current state on connect, then streams:
 
 - `task.status` payload `{status, agent_id, root_agent_id, task_id, session_id,
-  is_thread, active_subagent_count}`; seen values `running`, `completed`.
-  Only the root agent's status (agent_id == root_agent_id) ends a turn.
+  is_thread, active_subagent_count}`. The full vocabulary is measured in
+  "Turn-end semantics" below: only the root agent's `completed` ends a
+  turn, and only after `running` was seen from that root; other strings
+  are suspect and need history proof. `task_id` is the agent's identity,
+  constant per agent and equal to `root_agent_id` — never a turn epoch.
 - `approvals.snapshot` payload `{emitted_at_ms, pending_approvals[], recent_approvals[]}`;
   each approval has `approval_id`, `display.{summary_title, short_explanation,
   permission_question{kind,scope,text}, detail_rows}`, `payload.network_payload`,
@@ -166,3 +177,224 @@ Routes: `egress.approvals` GET /approvals (`pending`, `pending_approvals`,
 `recent`); `egress.approval.decide` POST /approvals/{id}/decide `{decision}` with
 decision in `allow_once|allow_session|allow_today|allow_always|deny|deny_always`
 (server also lists `timed_out`, `auto_allow`).
+
+## Turn-end semantics (measured live, 2026-10-28)
+
+Measured against a live account over 30 turns plus 2 cancels, driving
+`chat.subscribe` and `chat.history` directly. Where this section differs
+from older notes, it wins. Counts below are those measurements; anything
+not measured is marked unresolved.
+
+### `task.status` vocabulary
+
+| Value | Meaning for `wait` |
+|---|---|
+| `completed`, root agent, `running` seen first | DONE (exit 0) AT ONCE, no history proof: a live terminal after running ends the wait; the final replies are re-read from history afterwards |
+| `interrupted`, root agent, `running` seen first | FAILED (exit 2); no history proof required |
+| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; accepted from a replay only by a standalone wait via `accept_replayed_failed` (derived boundary, no newer user message), never by an explicit `--after-seq` wait |
+| `completed`/`interrupted`/any terminal replayed BEFORE `running` was seen in this wait | Suspect: stored, settled against history (below); a replayed `completed` never ends the wait alone, and a replayed FAILED ends it only via the boundary-turn proof |
+| Terminal with a missing `root_agent_id` (absent, or a subagent id with no root id) | Suspect IN CODE, never a direct end — even after `running` was seen; settled against history only. The root id is learned ONLY from a root-confirmed `running` (a subagent's own `task.status` carries `agent_id == root_agent_id` with a DIFFERENT root value) |
+| `running`, root agent only | The only in-progress value; the only value that may set `seen_running` |
+| `pending_init` | Suspect, never progress, for any agent |
+| `idle`, `complete`, `done`, `finished`, `succeeded`, `success`, and every other DONE/FAILED-looking string | Suspect-and-require-settle: stored, settled against history, accepted only with history proof + root scope + `running` seen; with no proof the wait keeps waiting, never exits 0 empty |
+| Any `task.status` from a non-root agent | Never terminal, whatever the string |
+| Root terminal with `active_subagent_count > 0` | Suspect, re-check (provisional: one observation, non-root `completed` 4.532 s before root `completed`) |
+
+Scope: filter `agent_id == root_agent_id` when `root_agent_id` is present;
+a missing root id makes the event suspect IN CODE (see the table). `sessions.updated` /
+`tasks.updated` arrive on scoped subscribes and must never count as
+progress; scope-check every event kind by `session_id` when present.
+A fresh subscribe replays the last terminal state (`completed` on a fresh
+thread, `interrupted` after a cancel): a replayed `completed` terminal
+alone never ends a wait — it needs `running` seen in this wait first, or
+history proof via settle. Settle never accepts FAILED; instead a
+replayed FAILED terminal exits 2 via `accept_replayed_failed` only for a
+standalone wait: root-confirmed, the boundary DERIVED from history (no
+explicit `--after-seq`) and known, and the latest `message.user` seq
+equal to that boundary (no newer user message). The replayed
+`task.status` seq is never used: live it is a stream counter that grows
+on every subscribe (observed 5988, 5991, 5994 while chat.history seqs
+were ~5196), not a chat seq, and the event carries no turn marker
+(`task_id` is agent identity). An explicit boundary (`wait --after-seq`,
+`send --wait`, the Telegram follower) names a turn that may not have
+started yet, so a replayed cancel there is never failure: the wait keeps
+waiting (124 at its timeout). New in 0.6.1: 0.6.0 returned 124 for a
+standalone wait after a cancel (it did not know `interrupted`).
+Residual: a standalone wait started after a cancel AND a new message
+whose turn has not started yet takes that new message as its boundary
+and exits 2 from the older cancel.
+
+### History settle
+
+A history event counts as a delivered reply only if ALL hold:
+`event_name = message.assistant`, `payload.status` exactly `completed`,
+`reply_to_message_id` (event or payload level) NOT equal to the
+message's own id: its `message_id`, that id without the
+`assistant-msg-` prefix, or `payload.metadata.root_message_execution_id`
+(a self-referential event is a proactive push;
+a `reply_to` pointing at another id is kept),
+`seq > after_seq`, `seq <=` the newest seq in the window of the history
+read that produced it (each read caps at its own window; the bound is
+not frozen at the first settle read). Dedup by (`seq`, `message_id`). `interrupted`-status
+assistant events are partials (two observed, 1998/2464 chars) and are
+excluded from replies, while the `interrupted` terminal itself needs no
+history proof. Media/widget-carrying completed assistant events count as
+replies even with empty text. `delta.presentation` and non-assistant
+events are excluded. Never use `transcript_revision` as a bound (observed
+constant 4993 against `seq_max` 4994, unresolved). Window: `limit=200`
+plus growth while `has_more` is set — `routes.json` has no cursor. The
+settled terminal is cleared only on a successful settle. One settle
+attempt per (re)subscribe: a resubscribe retries the settle once with a
+fresh read; a deaf stream replaying the same terminal does not pay a
+history fetch per record.
+`upto` semantics (as implemented): each history read caps at the newest
+seq in ITS OWN window; there is NO freeze of the bound at the first
+settle read — freezing would reintroduce the fast-turn loss (a reply
+landing after the freeze, before the terminal, would be excluded
+forever). A reply landing after a settle read is picked up by the next
+resubscribe settle retry or by the final-read lag window: after a `done`
+terminal whose final read returns empty, history is polled for ~2 s
+before reporting done. The final history read has a floored 5 s budget
+independent of the expired caller deadline (a collapsed 0.1 s timeout is
+what the gateway reports as "no response" even when healthy); a final
+read FAILURE still fails closed to 124, never a silent exit 0.
+
+### The `after_seq` boundary
+
+A standalone `wait` without an explicit `--after-seq` derives its
+boundary from the LAST `message.user` seq in a history window (or from a
+caller-supplied `user_seq`), never from the latest event's seq: the old
+`limit=1` latest-event snapshot made `after_seq` equal the reply's own seq
+whenever the reply had already landed, excluding it forever (split
+send+wait: 11 exit 0 / 9 exit 124 over 20 turns, perfectly separated by
+completion time). When no user event is found, the boundary depends on
+WHY (see below): only a genuinely empty window yields 0. Integrated
+`send --wait` passes the delivery `user_seq` and was immune.
+
+Three cases are distinguished, and only the third yields boundary 0:
+
+- Read ERROR: each window read is retried once, bounded. If a window
+  succeeds, its result is used. If NO window ever succeeds, the
+  boundary is UNKNOWN, not 0: settle-from-replay is disabled until a
+  live root `running` is seen, and the wait reports timeout with a
+  notice rather than delivering stale replies. When a live `running`
+  is then seen, its event seq ratchets the boundary up (a reply to
+  this turn necessarily follows the running event).
+- Window EXHAUSTION (`has_more` still true at limit 1000, no user
+  event): the boundary is the max seq seen in any successful window
+  (the old snapshot behaviour), not 0.
+- Genuinely EMPTY (successful read, `has_more` false, no user event):
+  the boundary is 0. STALE RISK, documented: with boundary 0 the wait
+  relies on terminal + scope checks, and a stale reply already in
+  history can be delivered as this turn's if a replayed terminal
+  settles against it. The risk is confined to threads whose history
+  predates the wait with no user event in the window.
+
+### Not turn signals
+
+`chat.stream_events` (global snapshot, no `task.status`),
+`tasks.subscribe` (no records while idle), `subagents.status` (400/404),
+`tasks.runs` (scheduled background jobs only). Do not use them to detect
+turn end.
+
+### Unresolved (do not assume)
+
+FAILED strings other than `interrupted`; the `idle` value; the
+approval-pending `task.status` value (0 pending in 3 elicitation
+attempts); whether a decide can safely be retried after a lost reply
+(`_safe_to_repeat("egress.approval.decide")` is False, no idempotency key
+— never retry a decide blindly). `approvals.snapshot` carries no
+`session_id`, so approval filtering cannot be proved session-scoped:
+auto-approve may decide an approval Muse did not scope to this session.
+Expired-but-listed approvals are ignored (the waiter filters by
+`request_expires_at_ms`): a clock running ahead hides them — known
+limitation, no surfacing. A standalone wait started after a cancel
+exits 2 (see the replay paragraph above); an explicit `--after-seq`
+wait never treats a replayed, older cancel as failure.
+Monitor forwarding delay: `sessions.updated` never counts as scoped
+progress (pinned by test_monitor_scoped_progress_and_watchdog — the
+records arrive on scoped subscribes for other sessions too, and the
+payload key that would scope them is unmeasured), so a change
+signalled only by `sessions.updated` is forwarded only when the
+60 s monitor watchdog fires (which runs a history catch-up check) or
+the next scoped turn signal arrives: worst case ~60 s + one history
+read, by code reading (`MONITOR_WATCHDOG=60`, `Monitor.tick`).
+Watermark granularity: a partially delivered batch retried by the
+monitor can duplicate the delivered part (per-item watermarking is a
+follow-up, not implemented). Same-path media in different turns can
+collide on the path-only dedup key (pre-existing). Single-flight
+`server_check` is a follow-up: bounding check threads would break the
+pinned property that a hung check never suppresses the next cadence
+check. A reply with no terminal ever still times out (124) by design
+(R4, Boss decision open). `transcript_revision` semantics unresolved. Subagent-own-root
+running-first: a subagent's root-confirmed `running` arriving before any
+main-root `running` is indistinguishable from main-root `running` in a
+single event, so the waiter could learn the subagent root and ignore the
+main root's terminal — causal ordering (the main agent must be running
+before it can spawn a subagent, and fresh subscribes replay terminals,
+not running records) makes this unlikely; known residual.
+
+### Wait constants (0.6.1)
+
+Watchdog 20 s without scoped progress (provisional — no progress-gap
+measurement supports tightening it); state-check budget 8 s subscribe
+(warm `task_state()` max 0.184 s over 5 calls, cold connect up to
+3.272 s); reconnect: each wait-path connect capped at 30 s
+(`connect_timeout=30` on `_wait_connection` → `bounded_connect`). The 30 s
+cap is the CLI wait path only; the Telegram follower's Bot Muse uses
+the 60 s default cap, so the hang bound below does not cover bot
+follows. The connect itself moved out from under `shared_lock` in `live()` so a slow
+handshake cannot serialise other threads, a storm of failed resubscribes
+switches to one bounded state check after 30 s, and resubscribe backoff
+sleeps are capped by the remaining caller deadline; heartbeat 25 s;
+server checks run on a cadence, NOT only on suspicion: every 60 s
+(`CHECK_EVERY`) an unconditional safety-net state check runs on a
+separate short subscription (8 s budget) even on a healthy stream, and
+every 20 s without scoped progress (`RECHECK_AFTER`) the stream is
+ended and resubscribed, which replays the current state and re-settles
+(a mid-turn state re-read, not a no-op); the watchdog (20 s without
+scoped progress) and the reconnect-storm switch are additional
+triggers. A resubscribe mid-turn is a state re-read: the server replays
+the current `task.status` and settle is retried; final history read
+floored at 5 s;
+lag window ~2 s after an empty `done` final read.
+Hang bound (CLI wait path only; the Telegram follower's Bot Muse uses
+the 60 s default connect cap, so this bound does not cover bot
+follows): caller timeout + 67 s worst overshoot (30 s in-flight
+wait-path connect + 37 s final phase: 30 s connect + 5 s floored final
+read + 2 s lag window), plus up to ~9 s pathological close cost
+(6 s heartbeat join + ~3 s gateway close) — 87 s typical, 96 s
+pathological, on a 20 s harness. Two readings: the detection bound
+from silence to report is watchdog 20 s + reconnect 30 s + final 7 s
+= 57 s, comfortably inside the 90 s Floor (this is the claimed Floor
+reading); the elapsed wall-time bound including close (87 s typical /
+96 s pathological) is NOT claimed to be inside the 90 s Floor. The
+reconnect-storm state check (8 s budget, synchronous in the wait loop
+via `note_failure`) runs before the caller deadline in the normal case
+and adds nothing to that overshoot; in the pathological case where it
+starts just before the deadline it can add up to 8 s to the elapsed
+overshoot, so the overshoot can reach 84 s (67 s + ~9 s close + 8 s) in
+the storm-straddle case — only on timeouts longer than 30 s, since the
+storm switch needs 30 s of failures, and unreachable on a 20 s harness,
+where the storm switch cannot fire before the deadline. Absolute elapsed
+is caller timeout + overshoot (e.g. 144 s on a 60 s timeout). The
+35 s Target is unreachable by design (one hung connect alone can
+consume 30 s). Concurrent state checks do not delay the return, and
+backoff cannot overshoot the deadline.
+
+M2 honesty: live terminal-to-exit latency is UNMEASURED post-fix. Do not
+cite the pre-fix exiting-subset numbers (median 0.469 s, p95 0.541 s,
+N=11) for the fixed code. The post-fix live evidence is 20/20 exit +
+exact replies on split send+wait — after_seq-fix evidence only, not a
+latency measurement.
+
+AuthError propagation (closed hazard): `AuthError` is a `RuntimeError`
+raised by the gateway on expired cookies. It is re-raised by `_run_wait`
+before the catch-all that reports unexpected failures as 124, so it
+reaches `main()` (exit 2, "auth error") and the Telegram turn caller's
+`AuthError` branch ("login expired, send /login"). Before this fix the
+catch-all swallowed it as 124, and any agent following "124 -> retry"
+looped forever on expired cookies; the Telegram login-expired branch
+was unreachable through a wait. `KeyboardInterrupt`/`SystemExit` were
+never caught (`except Exception` does not catch `BaseException`) and
+stay uncaught.

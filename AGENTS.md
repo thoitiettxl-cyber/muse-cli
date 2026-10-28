@@ -36,12 +36,33 @@
   connection before that (no raw fire-and-forget).
 - `wait` (and `send --wait/--until-done`) survive a connection that dies
   silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
-  replaces a dead connection and resubscribes; connects and the Noise
-  handshake are bounded (60 s / 20 s), and every 60 s the turn state is
-  checked on the server, so a turn that ended while the stream was deaf is
-  reported at once with its final replies. Reconnects are quiet; only after
+  replaces a dead connection and resubscribes (each wait-path connect capped
+  at 30 s, CLI wait path only — the Telegram follower uses the 60 s default
+  cap; a reconnect storm switches to one bounded state check after 30 s),
+  and checks the turn state on the server on a cadence, not only when a
+  gap is suspected: every 60 s an unconditional safety-net state check
+  runs on a separate short subscription (8 s budget) even on a healthy
+  stream, and every 20 s without scoped progress the stream is ended
+  and resubscribed, which replays the current state and re-settles (a
+  mid-turn state re-read, not a no-op); the watchdog (20 s without
+  scoped progress) and the reconnect-storm switch are additional
+  triggers, so a turn that ended while the stream was deaf is reported
+  at once with its final replies. A live terminal
+  after `running` ends a turn at once with no history proof (a replayed
+  `completed` or suspect terminal needs history proof); `interrupted`
+  after `running` exits 2 with no history proof; `cancelled`/`canceled`
+  are retained from the pre-existing cancel flow, not live-measured.
+  A standalone `wait` (no `--after-seq`) started after a cancel exits 2
+  (new in 0.6.1; 0.6.0 returned 124): the replayed `interrupted` is
+  accepted only when the boundary was read from history and no user
+  message is newer than it. An explicit `--after-seq` wait (and `send
+  --wait`, the Telegram bot) never treats a replayed, older cancel as
+  failure; it keeps waiting (124 at its timeout).
+  Reconnects are quiet; only after
   about a minute without Muse does stderr get one `wait: can't reach Muse`
-  line (and `wait: reconnected` when it is back). Exit codes are unchanged.
+  line (and `wait: reconnected` when it is back). Exit codes are 0/2/4/124
+  as listed below; the standalone-wait-after-cancel exit 2 above is new
+  in 0.6.1 (0.6.0 reported 124 there).
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
   `4` needs a human: a question in the final reply (widget or plain text,
@@ -83,7 +104,9 @@ the warning names its title, kind, scope and offered options. If the
 monitor and a turn present the same approval at once, the second caller
 waits up to 15 seconds for the in-flight claim to resolve instead of
 ending the turn as `needs_approval`; if the claim fails or times out,
-the second caller decides it itself.
+the second caller decides it itself. Approvals carry no session id
+(`approvals.snapshot` has none), so auto-approve may decide an approval
+Muse did not scope to this session.
 
 ```bash
 muse-cli auto-approve status   # {"auto_approve": "always"|"off", "auto_allow_once": true|false, ...}

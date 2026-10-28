@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from muse_cli.wait import (EXIT_FAILED, EXIT_HUMAN, EXIT_OK, EXIT_TIMEOUT, ONCE, Waiter,
@@ -15,7 +16,10 @@ def ts(status, **kw):
     return {"event": "task.status", "payload": p, "seq": 1, "type": "event"}
 
 
-APPROVAL = {"approval_id": "a1", "request_expires_at_ms": 5,
+APPROVAL = {"approval_id": "a1",
+            # Expiry is enforced (D7): a long-expired fixture must be ignored,
+            # so this one expires an hour from now, not at epoch + 5 ms.
+            "request_expires_at_ms": int(time.time() * 1000) + 3600_000,
             "display": {"summary_title": "Share info with github.com",
                         "short_explanation": "clone repo",
                         "permission_question": {"kind": "network_access", "scope": "github.com",
@@ -65,24 +69,45 @@ class ChooseAutoDecisionTest(unittest.TestCase):
 
 class WaiterTest(unittest.TestCase):
     def test_done_and_failed(self):
+        # muse01: only "completed" is a proven DONE and only "interrupted"
+        # a proven FAILED; a terminal without a prior "running" is a stale
+        # replay and needs history proof (settle), even for "failed".
         w = Waiter()
         self.assertIsNone(w.feed(ts("running")))
         self.assertEqual(w.feed(json.dumps(ts("completed"))), ("done", "completed"))
-        self.assertEqual(Waiter().feed(ts("failed")), ("failed", "failed"))
+        self.assertIsNone(Waiter().feed(ts("failed")))
+        self.assertEqual(Waiter().feed(ts("interrupted")), None)
+        w2 = Waiter()
+        w2.feed(ts("running"))
+        self.assertEqual(w2.feed(ts("interrupted")), ("failed", "interrupted"))
 
     def test_require_running_skips_stale_snapshot(self):
+        # muse01: "idle" is suspect, never a direct done; the replayed
+        # "completed" needs history proof, and "idle" after running does too.
         w = Waiter(require_running=True)
         self.assertIsNone(w.feed(ts("completed")))
+        self.assertEqual(w.settle([{"seq": 9, "text": "fast", "message_id": "m9"}]),
+                         ("done", "completed"))
+        w = Waiter(require_running=True)
         w.feed(ts("running"))
-        self.assertEqual(w.feed(ts("idle"))[0], "done")
+        self.assertIsNone(w.feed(ts("idle")))
+        self.assertEqual(w.settle([{"seq": 9, "text": "x", "message_id": "m9"}]),
+                         ("done", "idle"))
 
     def test_ignores_subagents_and_other_threads(self):
+        # muse01: a replayed "completed" (no running seen) never ends the
+        # wait alone; it settles only with a history reply.
         w = Waiter()
         self.assertIsNone(w.feed(ts("completed", agent_id="sub")))
         self.assertIsNone(w.feed(ts("completed", is_thread=True)))
+        self.assertIsNone(w.feed(ts("completed")))
+        self.assertEqual(w.settle([{"seq": 9, "text": "x", "message_id": "m9"}]),
+                         ("done", "completed"))
         t = Waiter(thread="T1")
         self.assertIsNone(t.feed(ts("completed", session_id="other", is_thread=True)))
-        self.assertEqual(t.feed(ts("completed", session_id="T1", is_thread=True))[0], "done")
+        self.assertIsNone(t.feed(ts("completed", session_id="T1", is_thread=True)))
+        self.assertEqual(t.settle([{"seq": 9, "text": "x", "message_id": "m9"}]),
+                         ("done", "completed"))
 
     def test_approval(self):
         w = Waiter()
@@ -98,7 +123,9 @@ class WaiterTest(unittest.TestCase):
 
 class HistoryTest(unittest.TestCase):
     def ev(self, seq, name, text, widgets=None):
-        p = {"display_text": text, "message_id": f"m{seq}"}
+        # muse01 D4: only status="completed" assistant events are replies;
+        # a status-less event is still being written.
+        p = {"display_text": text, "message_id": f"m{seq}", "status": "completed"}
         if widgets:
             p["widgets"] = widgets
         return {"seq": seq, "event_name": name, "payload": p}

@@ -1163,6 +1163,26 @@ def test_auth_expiry_notified_once(env):
     assert any("works again" in t for t in env.tg.texts())
 
 
+def test_turn_auth_error_shows_login_expired(env):
+    """AuthError inside a turn's wait must reach run_turn's AuthError
+    branch (login-expired message), not be swallowed as a 124 timeout
+    turn-end. Drives the real _follow -> cli.run_wait path with a
+    connector whose stream fails auth after delivery."""
+    from muse_cli.gateway import AuthError
+
+    class AuthFailGateway(FakeGateway):
+        def subscribe_raw(self, method, body=None, on_record=None, should_stop=None, **kw):
+            raise AuthError("auth/check -> 401 (cookies expired? re-export)")
+
+    def broken(cfg):
+        return AuthFailGateway(env.s)
+    env.bot.muse.connector = broken
+    env.bot.handle_update(msg("hello"))
+    texts = env.tg.texts()
+    assert any("login expired" in t for t in texts)
+    assert not any("timed out" in t for t in texts)
+
+
 def test_cookies_via_login(env):
     env.bot.handle_update(msg("/login"))
     env.bot.handle_update(msg("hatch_sess=abc; other=1"))
@@ -1571,7 +1591,8 @@ def test_resubscribed_stream_does_not_duplicate_text(env):
     for _ in range(2):   # the same message streamed again after a re-subscription
         t.on_event(json.dumps({"event": "delta.message_start", "payload": {"message_id": "a"}}))
         t.on_event(json.dumps({"event": "delta.text_append", "payload": {"message_id": "a", "text": "Hi"}}))
-    assert t.parts["a"] == "Hi"
+    assert list(t.parts.values()) == ["Hi"]
+    assert t.body() == "Hi"
 
 
 def _online():

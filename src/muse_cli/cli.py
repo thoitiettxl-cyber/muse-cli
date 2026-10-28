@@ -929,16 +929,23 @@ def cmd_download(args):
 def is_reply(ev, baseline):
     """True for a genuine assistant reply (not a proactive push).
 
-    In history, genuine replies are message.assistant events with an empty
-    reply_to_message_id; proactive pushes (Telegram drafts, background task
-    updates) are self-referential there.
-    """
+    Proactive pushes (Telegram drafts, background task updates) are
+    self-referential: reply_to_message_id equals the message's own id
+    (see wait.is_self_referential for the live id forms). A genuine reply
+    may carry reply_to pointing at the message it answers, so only a
+    self-reference drops it — the same rule as
+    replies_after (see wait.is_self_referential, pinned by test
+    test_is_reply_agrees_with_replies_after). Note: is_reply is
+    currently uncalled in src (chat.new_replies uses the same helper);
+    it is kept, fixed, and tested so the two reply filters cannot
+    drift apart silently."""
     if ev.get("event_name") != "message.assistant":
         return False
     if (ev.get("seq") or 0) <= baseline:
         return False
     p = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
-    if (ev.get("reply_to_message_id") or p.get("reply_to_message_id")):
+    from .wait import is_self_referential
+    if is_self_referential(ev)[0]:
         return False
     if not (p.get("display_text") or p.get("content")):
         return False
@@ -994,8 +1001,8 @@ def deliver(gw, cfg, text, thread=None, ack_timeout=30, mark=None):
     # Wait for delivery: our message.user must show up in history with a
     # seq. Closing the connection before that can drop the message.
     from .wait import user_ack
-    user_seq, ack_deadline = None, time.time() + ack_timeout
-    while user_seq is None and time.time() < ack_deadline:
+    user_seq, ack_deadline = None, time.monotonic() + ack_timeout
+    while user_seq is None and time.monotonic() < ack_deadline:
         try:
             h = gw.call_json("chat.history", body={"limit": 10, **scope})
             user_seq = user_ack(h.get("chat_events", []), baseline, text)
@@ -1143,10 +1150,31 @@ def make_auto_approver(cfg, approved, errors, connector=None, allow_once=False):
     return approve
 
 
-def task_state(gw, thread=None, timeout=6):
-    """Muse's current task status for the main chat or THREAD, as the server
-    replays it on chat.subscribe (e.g. "running", "completed"), or None."""
-    from .wait import task_status
+RECHECK_AFTER = 20      # watchdog: seconds without scoped progress before re-checking
+WATCHDOG = RECHECK_AFTER
+STATE_CHECK_BUDGET = 8  # one server state check may take at most this long (subscribe)
+RECONNECT_BUDGET = 30   # one shared deadline for a storm of failed resubscribes
+HISTORY_LIMITS = (200, 500, 1000)  # history window growth when has_more truncates
+ONLINE_GRACE = 3        # Muse said "online" (idle) but no turn end followed within this
+RESUB_PAUSE = 1.0       # pause before re-subscribing after a stream ended
+FINAL_READ_FLOOR = 5    # floored budget for the final history read, independent
+# of the (possibly expired) caller deadline; counted in the hang bound
+LAG_WINDOW = 2.0        # after a `done` terminal with an empty final read,
+# keep polling history this long for a just-landed reply
+LAG_POLL = 0.25         # interval between lag-window history reads
+
+
+CHECK_EVERY = 60        # safety net: re-read the turn state from the server this often
+
+
+def task_state_info(gw, thread=None, timeout=STATE_CHECK_BUDGET, prefer_last=False):
+    """The first scoped task.status event the server replays on
+    chat.subscribe, with its full payload (root id, subagent count), or
+    None. With prefer_last, the LAST scoped event instead: a replay can
+    carry running then completed, and the freshest status is the current
+    one. Callers that need the vocabulary decision use
+    task_status_info on the event; task_state() keeps the string form."""
+    from .wait import task_status_info
     found = []
 
     def on_record(line):
@@ -1154,34 +1182,41 @@ def task_state(gw, thread=None, timeout=6):
             ev = json.loads(line)
         except (ValueError, TypeError):
             return False
-        s = task_status(ev, thread)
-        if s:
-            found.append(s)
-            return True
+        if task_status_info(ev, thread) is not None:
+            found.append(ev)
+            return not prefer_last
         return False
     body = {"capabilities": ["chat_cancel", "delta_stream"]}
     if thread:
         body["session_id"] = thread
     gw.subscribe_raw("chat.subscribe", body=body, max_records=50, idle_timeout=timeout,
                      overall_timeout=timeout, on_record=on_record)
-    return found[0] if found else None
+    if not found:
+        return None
+    return found[-1] if prefer_last else found[0]
 
 
-RECHECK_AFTER = 30      # seconds without any live record before re-checking the server
-ONLINE_GRACE = 3        # Muse said "online" (idle) but no turn end followed within this
-RESUB_PAUSE = 1.0       # pause before re-subscribing after a stream ended
-
-
-CHECK_EVERY = 60        # safety net: re-read the turn state from the server this often
+def task_state(gw, thread=None, timeout=6):
+    """Muse's current task status for the main chat or THREAD, as the server
+    replays it on chat.subscribe (e.g. "running", "completed"), or None."""
+    ev = task_state_info(gw, thread, timeout=timeout)
+    if ev is None:
+        return None
+    from .wait import task_status_info
+    info = task_status_info(ev, thread)
+    return info["status"] if info else None
 
 
 def _wait_connection(cfg, log=None):
     """The warm, heartbeat-checked connection a CLI wait runs on. Only an
-    outage longer than a minute is reported on stderr (once), then its end."""
+    outage longer than a minute is reported on stderr (once), then its end.
+
+    connect_timeout=30 caps each wait-path connect at 30 s (the shared
+    60 s default would let one connect eat the whole hang bound)."""
     import logging
     from .conn import Muse
     log = log or logging.getLogger("muse_cli.wait")
-    return Muse(cfg=cfg, log=log,
+    return Muse(cfg=cfg, log=log, connect_timeout=30,
                 on_down=lambda err, secs: log.warning(
                     "wait: can't reach Muse for %.0fs (%s); still retrying", secs, err),
                 on_up=lambda secs: log.warning("wait: reconnected to Muse after %.0fs", secs))
@@ -1214,6 +1249,34 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
               on_event=None, auto_approve=None, connector=None, approver=None,
               should_stop=None, recheck=None, recheck_after=None, log=None,
               auto_allow_once=None, check_every=None):
+    """See _run_wait_inner. Any unexpected failure inside the wait is
+    reported as a timeout (exit 124), never a traceback exit 1: the
+    exit-code contract is 0/2/4/124. AuthError is not unexpected: it is
+    re-raised so the caller (main() -> exit 2, the Telegram turn caller
+    -> "login expired, send /login") sees it; swallowing it as 124 would
+    send every "124 -> retry" agent into an infinite loop on expired
+    cookies. KeyboardInterrupt/SystemExit are BaseExceptions, so the
+    `except Exception` below never catches them."""
+    import logging
+    from .wait import EXIT_TIMEOUT
+    log = log or logging.getLogger("muse_cli.wait")
+    try:
+        return _run_wait_inner(cfg, thread, after_seq, timeout, require_running, on_event,
+                               auto_approve, connector, approver, should_stop, recheck,
+                               recheck_after, log, auto_allow_once, check_every)
+    except AuthError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the contract is exit codes, not tracebacks
+        log.warning("wait: unexpected error (%s: %s); reporting timeout", type(e).__name__, e)
+        return EXIT_TIMEOUT, {"outcome": "timeout", "status": None, "after_seq": after_seq,
+                              "final_text": None, "replies": [],
+                              "note": "wait failed internally; run `muse-cli wait` again"}
+
+
+def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
+                    on_event=None, auto_approve=None, connector=None, approver=None,
+                    should_stop=None, recheck=None, recheck_after=None, log=None,
+                    auto_allow_once=None, check_every=None):
     """Subscribe until the turn ends, a human is needed, or timeout.
 
     auto_approve: True/False per call, None to use MUSE_AUTO_APPROVE or the
@@ -1232,24 +1295,32 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
     - a terminal status replayed before our turn was seen running is checked
       against chat.history (a reply after after_seq means the turn already
       ran and ended, e.g. a fast answer that finished before we subscribed);
-    - when no record arrives for recheck_after seconds (watchdog), or the
-      stream ends, or recheck() returns True, the subscription is reopened
-      on a fresh connection: the server replays the current task.status, so
-      the state is re-read from the server instead of waiting forever;
+      only `completed`/`interrupted` are proven terminal values, other
+      strings need the same history proof (see muse_cli.wait);
+    - when no SCOPED record arrives for recheck_after seconds (watchdog,
+      20 s), or the stream ends, or recheck() returns True, the
+      subscription is reopened on a fresh connection: the server replays
+      the current task.status, so the state is re-read from the server
+      instead of waiting forever. sessions.updated/tasks.updated and
+      other-thread records are not progress and never reset the watchdog;
     - a dropped connection (detected by the connector's heartbeat) is
       replaced and the subscription reopened the same way, so a turn that
-      ended during the gap is reported at once with its replies;
+      ended during the gap is reported at once with its replies. A storm
+      of failed resubscribes lasting RECONNECT_BUDGET (30 s) triggers one
+      bounded state check instead of storming until the timeout;
     - every check_every seconds (CHECK_EVERY) the turn state is also read
-      on a separate short subscription, plus chat.history when needed,
-      while the main stream stays open: a missed turn end is caught even
-      when the stream looks alive.
+      on a separate short subscription (8 s budget), plus chat.history
+      when needed, while the main stream stays open: a missed turn end
+      is caught even when the stream looks alive. A hung check never
+      suppresses the next cadence check.
 
-    Returns (exit_code, result). The final replies are re-read from
-    chat.history on a fresh connection (the subscription's reader thread
-    still owns the old one).
+    All duration enforcement uses the monotonic clock. Returns
+    (exit_code, result). The final replies are re-read from chat.history
+    on a fresh connection (the subscription's reader thread still owns
+    the old one).
     """
     from .wait import (Waiter, replies_after, exit_code, outcome_of, needs_input_reason,
-                       question_of, in_scope)
+                       question_of, in_scope, FAILED)
     import logging
     import threading
     log = log or logging.getLogger("muse_cli.wait")
@@ -1272,84 +1343,239 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
     approved, approve_errors = [], []
     conn = connector or connect
     recheck_after = RECHECK_AFTER if recheck_after is None else recheck_after
+    deadline = time.monotonic() + timeout
     if enabled:
         approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn,
                                                   allow_once=once_enabled)
     else:
         approver = None
 
-    def history_replies(limit=30):
-        g = conn(cfg)
-        try:
-            return replies_after(g.call_json("chat.history", body={"limit": limit, **scope})
-                                 .get("chat_events", []), after_seq)
-        finally:
-            g.close()
+    def history_replies(limit=None, floor=0.1, cap=None):
+        """Replies after after_seq, capped at the newest seq read.
 
-    if after_seq is None:
-        gw = conn(cfg)
-        try:
-            h = gw.call_json("chat.history", body={"limit": 1, **scope})
-            evs = h.get("chat_events", [])
-            after_seq = max((e.get("seq") or 0 for e in evs), default=0)
-            # A plain `wait` after the last message: anything newer counts.
-        finally:
-            gw.close()
+        The window grows (200/500/1000) while the server says has_more
+        and the oldest event is still newer than after_seq: a truncated
+        window must not hide a reply that landed before it. FLOOR is the
+        minimum budget for one read: the final read passes
+        FINAL_READ_FLOOR so an expired caller deadline cannot collapse
+        its timeout to 0.1 s (which the gateway reports as 'no response'
+        even when it is healthy). CAP bounds the budget (lag-window
+        polls)."""
+        for lim in HISTORY_LIMITS:
+            if limit is not None:
+                lim = limit
+            g = conn(cfg)
+            try:
+                budget = max(floor, deadline - time.monotonic())
+                if cap is not None:
+                    budget = min(budget, max(cap, 0.1))
+                kw = {"body": {"limit": lim, **scope},
+                      "timeout": budget}
+                if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                    kw["_deadline"] = time.monotonic() + budget
+                resp = g.call_json("chat.history", **kw)
+                evs = resp.get("chat_events", []) or []
+            finally:
+                g.close()
+            upto = max((e.get("seq") or 0 for e in evs if isinstance(e, dict)), default=None)
+            out = replies_after(evs, after_seq, upto=upto)
+            if limit is not None or not resp.get("has_more") or not evs:
+                return out
+            oldest = min((e.get("seq") or 0 for e in evs if isinstance(e, dict)), default=0)
+            if oldest <= after_seq:
+                return out
+        return out
+
+    def latest_user_seq(floor=0.1):
+        """Max message.user seq in a history window, or None when no user
+        event is found. The window grows exactly like history_replies
+        (200/500/1000 while has_more and the oldest event is still newer
+        than after_seq): a truncated window must not hide a newer user
+        event that would prove a FAILED terminal stale. Growth stops
+        once the window reaches after_seq, so the common case is one
+        read. A transport error propagates to the caller, which retries
+        on the next record; None is a proved answer (no user event in
+        the window), not a failure. Used only to prove a replayed FAILED
+        terminal belongs to the boundary turn (see
+        Waiter.accept_replayed_failed). FLOOR is the minimum budget for
+        one read, as in history_replies (the last-chance check at timeout
+        passes FINAL_READ_FLOOR)."""
+        seen = None
+        for lim in HISTORY_LIMITS:
+            g = conn(cfg)
+            try:
+                budget = max(floor, deadline - time.monotonic())
+                kw = {"body": {"limit": lim, **scope}, "timeout": budget}
+                if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                    kw["_deadline"] = time.monotonic() + budget
+                resp = g.call_json("chat.history", **kw)
+                evs = resp.get("chat_events", []) or []
+            finally:
+                g.close()
+            for e in evs:
+                if isinstance(e, dict) and e.get("event_name") == "message.user":
+                    s = e.get("seq") or 0
+                    seen = s if seen is None else max(seen, s)
+            if not resp.get("has_more") or not evs:
+                return seen
+            oldest = min((e.get("seq") or 0 for e in evs if isinstance(e, dict)), default=0)
+            if oldest <= after_seq:
+                return seen
+        return seen
+
+    def derive_after_seq():
+        """The boundary for a standalone wait: the last message.user seq
+        in a history window, or 0 when none is found. Returns
+        (boundary, known): KNOWN is False when no window read ever
+        succeeded, so the caller must not settle from a replay.
+
+        Never the latest event's seq: when the reply already landed, the
+        latest event IS the reply, and snapshotting it would exclude the
+        reply from every settle read forever (fast-turn race). A read
+        ERROR is retried once per window (bounded by the same timeout);
+        if every window still fails, the boundary is unknown, not 0.
+        Window EXHAUSTION (has_more still true at limit 1000, no user
+        event) falls back to the max seq seen in any successful window
+        (the old snapshot behaviour), not 0. Only a genuinely empty
+        window (successful read, has_more false, no user event) yields
+        (0, True)."""
+        seen_max = 0
+        succeeded = False
+        for lim in HISTORY_LIMITS:
+            evs = None
+            for _attempt in range(2):  # one bounded retry on a read error
+                try:
+                    g = conn(cfg)
+                    try:
+                        kw = {"body": {"limit": lim, **scope},
+                              "timeout": max(0.1, deadline - time.monotonic())}
+                        if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
+                            kw["_deadline"] = deadline
+                        resp = g.call_json("chat.history", **kw)
+                        evs = resp.get("chat_events", []) or []
+                    finally:
+                        g.close()
+                    break
+                except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+                    log.warning("wait: could not read history for the boundary: %s", e)
+                    evs = None
+            if evs is None:
+                continue  # this window never succeeded; try the next, then fail closed
+            succeeded = True
+            seen_max = max(seen_max,
+                           max((e.get("seq") or 0 for e in evs if isinstance(e, dict)),
+                               default=0))
+            user = [e.get("seq") or 0 for e in evs
+                    if isinstance(e, dict) and e.get("event_name") == "message.user"]
+            if user:
+                return max(user), True
+            if not resp.get("has_more") or not evs:
+                return 0, True
+        if not succeeded:
+            return 0, False
+        return seen_max, True
+
+    boundary_known = True
+    derived = after_seq is None
+    if derived:
+        after_seq, boundary_known = derive_after_seq()
     w = Waiter(thread=thread, require_running=require_running, approver=approver)
+    w.boundary_unknown = not boundary_known
+    w.after_seq = after_seq
+    w.boundary_derived = derived and boundary_known
+
+    def ratchet_boundary():
+        """When the boundary was never read, a live root `running` is the
+        only trustworthy lower bound for this turn's replies: ratchet
+        after_seq up to the running event's seq, so no stale reply can
+        be delivered as this turn's. One-way only; a no-op once the
+        boundary was read."""
+        nonlocal after_seq
+        if not boundary_known and w.running_seq is not None and w.running_seq > after_seq:
+            after_seq = w.running_seq
+            w.after_seq = after_seq
+
     body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
-    deadline = time.time() + timeout
     user_stop = should_stop or (lambda: False)
     forced = [False]
-    last_record = [time.time()]
+    last_record = [time.monotonic()]
     online_at = [0.0]          # when Muse said "online" (idle) mid-turn
     wlock = threading.RLock()  # the Waiter is fed by the stream and by server_check
-    last_check = [time.time()]
-    checking = threading.Lock()
+    last_check = [time.monotonic()]
+    first_failure_at = [0.0]   # start of the current reconnect storm
+    auth_error = [None]        # AuthError seen by a server_check thread: ends the wait
 
     def server_check():
         """Read the turn state on its own short subscription (the server
-        replays task.status) and settle it like a live one."""
-        if not checking.acquire(blocking=False):
-            return
+        replays task.status) and settle it like a live one.
+
+        No network I/O happens under wlock: the state read and the history
+        read run outside it, and the waiter is re-checked under the lock
+        before anything is applied. feed() itself runs under wlock, so an
+        approver's decide is serialised against other offers (the check's
+        own reads stay outside the lock). Checks are never serialized against
+        each other: a hung check must not suppress the next cadence check
+        (stop_now stamps last_check when it spawns, not when a check
+        finishes), and the waiter lock makes overlapping checks safe."""
+        from .wait import task_status_info
         try:
             g = conn(cfg)
             try:
-                s = task_state(g, thread, timeout=8)
+                ev = task_state_info(g, thread, timeout=STATE_CHECK_BUDGET, prefer_last=True)
             finally:
                 g.close()
-            if not s:
+            if ev is None:
                 return
-            ev = {"event": "task.status", "payload": {"status": s, "session_id": thread,
-                                                      "is_thread": bool(thread)}}
             with wlock:
                 if w.result is None:
                     w.feed(ev)
-                pending = w.result is None and w.ignored_terminal
+                    ratchet_boundary()
+                # Capture the pending terminal BEFORE the history read:
+                # settle only if it is still the same terminal when the
+                # read returns (a mid-read swap must not be settled with
+                # another terminal's proof).
+                pending = w.ignored_terminal if w.result is None else None
             if pending:
-                replies = history_replies()
-                with wlock:
-                    if w.result is None and w.ignored_terminal:
-                        w.settle(replies)
+                if pending in FAILED:
+                    # Replayed FAILED terminal: prove it belongs to the
+                    # boundary turn from its seq (no replies are read: a
+                    # cancelled turn exits 2 with 0 replies).
+                    latest = latest_user_seq()
+                    with wlock:
+                        if w.result is None and w.ignored_terminal == pending:
+                            w.accept_replayed_failed(latest)
+                else:
+                    replies = history_replies()
+                    with wlock:
+                        if w.result is None and w.ignored_terminal == pending:
+                            w.settle(replies)
             if w.result is not None:
                 log.info("wait: periodic check: turn over (status %s)", w.status)
+            info = task_status_info(ev, thread)
+            if info and info["status"] == "running" and info["root_confirmed"]:
+                last_record[0] = time.monotonic()  # confirmed progress
+        except AuthError as e:
+            # Expired login: not a transient failure. Hand it to the wait
+            # loop (this may run on a daemon thread), which stops and
+            # re-raises it so the caller reports an auth error, not 124.
+            auth_error[0] = e
         except Exception as e:  # noqa: BLE001 - a safety net must never break the wait
             log.debug("wait: periodic check failed: %s", e)
-        finally:
-            last_check[0] = time.time()
-            checking.release()
 
     def stop_now():
         if user_stop():
             return True
+        if auth_error[0] is not None:
+            return True
         if w.result is not None:
             return True
-        if check_every and time.time() - last_check[0] > check_every and not checking.locked():
-            last_check[0] = time.time()
+        if check_every and time.monotonic() - last_check[0] > check_every:
+            last_check[0] = time.monotonic()
             threading.Thread(target=server_check, daemon=True, name="wait-check").start()
-        if (recheck and recheck()) or (recheck_after and time.time() - last_record[0] > recheck_after):
+        if (recheck and recheck()) or (recheck_after and time.monotonic() - last_record[0] > recheck_after):
             forced[0] = True
             return True
-        if online_at[0] and time.time() - online_at[0] > ONLINE_GRACE:
+        if online_at[0] and time.monotonic() - online_at[0] > ONLINE_GRACE:
             # Muse went idle but no terminal task.status followed: re-read the
             # state from the server instead of trusting this stream.
             log.info("Muse is online (idle) with no turn end on the stream; re-checking")
@@ -1358,94 +1584,215 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
             return True
         return False
 
+    settle_state = {"ignored": None, "tried": False}
+
     def on_record(line):
         if on_event:
             on_event(line)
         with wlock:
             if w.result is not None or w.feed(line) is not None:
+                ratchet_boundary()
                 return True
+            ratchet_boundary()
         try:
             ev = json.loads(line)
         except (ValueError, TypeError):
             ev = {}
         name = str(ev.get("event") or ev.get("event_name") or "") if isinstance(ev, dict) else ""
-        if name.startswith(("delta.", "task.", "agent.", "message.")):
-            last_record[0] = time.time()   # progress; keep-alives do not count
+        if name.startswith(("delta.", "task.", "agent.", "message.")) and in_scope(ev, thread):
+            last_record[0] = time.monotonic()  # scoped progress only; keep-alives
+            # and other-thread records do not count
         p = ev.get("payload") if isinstance(ev, dict) and isinstance(ev.get("payload"), dict) else {}
         if (name == "agent.status" and p.get("activity_code") == "online" and w.seen_running
                 and in_scope(ev, thread)):
             # Muse went idle but no terminal task.status came with it (yet):
             # re-read the state from the server instead of trusting the stream.
             if not online_at[0]:
-                online_at[0] = time.time()
+                online_at[0] = time.monotonic()
         elif name in ("delta.text_append", "delta.message_start") or (
                 name == "agent.status" and p.get("activity_code") not in (None, "online")):
             online_at[0] = 0.0
-        if w.ignored_terminal:
+        ignored = w.ignored_terminal
+        if ignored != settle_state["ignored"]:
+            settle_state["ignored"] = ignored
+            settle_state["tried"] = False
+        if ignored and not settle_state["tried"]:
+            # One history read per ignored terminal, not one per record:
+            # a deaf stream replaying the same terminal must not pay a
+            # history fetch per record. A failed read retries on the next
+            # record; a later terminal resets the flag above.
+            settle_state["tried"] = True
+            if ignored in FAILED:
+                # A replayed FAILED terminal never settles with replies:
+                # prove it belongs to the boundary turn from its seq, and
+                # exit 2 with 0 replies. A FAILED terminal from an older
+                # turn keeps waiting for the live turn.
+                try:
+                    latest = latest_user_seq()
+                except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+                    log.debug("failed-terminal check failed: %s", e)
+                    settle_state["tried"] = False
+                    return False
+                with wlock:
+                    tseq = w.ignored_terminal_seq
+                    settled = (w.accept_replayed_failed(latest)
+                               if w.ignored_terminal == ignored else None)
+                if settled is not None:
+                    log.info("turn already failed (status %s, terminal seq %s)",
+                             w.status, tseq)
+                    return True
+                return False
             try:
                 replies = history_replies()
             except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
                 log.debug("history check failed: %s", e)
+                settle_state["tried"] = False
                 return False
             with wlock:
-                settled = w.settle(replies)
+                settled = w.settle(replies) if w.ignored_terminal == ignored else None
             if settled is not None:
                 log.info("turn already over (status %s, %d reply(s) after seq %s)",
                          w.status, len(replies), after_seq)
                 return True
         return False
 
+    def note_failure():
+        """One shared reconnect budget: after RECONNECT_BUDGET of failed
+        resubscribes, run one bounded state check (which may settle the
+        turn with proof) instead of storming until the caller's timeout."""
+        now = time.monotonic()
+        if not first_failure_at[0]:
+            first_failure_at[0] = now
+        elif now - first_failure_at[0] > RECONNECT_BUDGET:
+            first_failure_at[0] = 0.0
+            log.info("wait: reconnect storm past %ss; checking the server state", RECONNECT_BUDGET)
+            server_check()
+
     attempt, failures = 0, 0
-    while w.result is None and time.time() < deadline and not user_stop():
+    while (w.result is None and time.monotonic() < deadline and not user_stop()
+           and auth_error[0] is None):
         if attempt:
             # failures counts consecutive ones: a single drop resubscribes after RESUB_PAUSE
-            time.sleep(min(RESUB_PAUSE * (2 ** min(failures - 1, 5)), 30) if failures else RESUB_PAUSE)
-            if w.result is not None or user_stop() or time.time() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            backoff = RESUB_PAUSE * (2 ** min(failures - 1, 5)) if failures else RESUB_PAUSE
+            time.sleep(min(backoff, remaining))
+            if w.result is not None or user_stop() or time.monotonic() >= deadline:
                 break
         attempt += 1
+        # A (re)subscribe replays the terminal state afresh: one new
+        # settle attempt per subscribe, not per record (see on_record).
+        settle_state["tried"] = False
         forced[0] = False
         online_at[0] = 0.0
-        last_record[0] = time.time()
-        left = max(1, deadline - time.time())
+        last_record[0] = time.monotonic()
+        left = max(1, deadline - time.monotonic())
         idle = min(left, recheck_after) if recheck_after else left
         try:
             gw = conn(cfg)
         except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
             failures += 1
             log.warning("wait: connect failed (%s); retrying", e)
+            note_failure()
             continue
         try:
             gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9,
                              idle_timeout=idle, overall_timeout=left, on_record=on_record,
                              should_stop=stop_now)
             failures = 0
+            first_failure_at[0] = 0.0
         except ConnectionError as e:
             # A dropped connection: resubscribe; the server replays the current
             # task.status and the final replies are read from chat.history, so
             # nothing said during the gap is lost.
             failures += 1
             log.info("wait: connection dropped (%s); resubscribing", e)
+            note_failure()
         except (GatewayError, TimeoutError, OSError) as e:
             failures += 1
             log.warning("wait: subscription failed (%s); retrying", e)
+            note_failure()
         finally:
             gw.close()
-        if w.result is None and not user_stop() and time.time() < deadline:
+        if w.result is None and not user_stop() and time.monotonic() < deadline:
             log.debug("wait: re-checking the server (%s; status %s)",
                       "requested" if forced[0] else "no events / stream ended", w.status)
+    if auth_error[0] is not None:
+        raise auth_error[0]
     kind, detail = w.result or ("timeout", w.status)
-    replies = []
-    try:
-        gw = conn(cfg)
+    if kind == "timeout" and w.ignored_terminal in FAILED:
+        # The wait ended (timeout or stop) with a replayed FAILED terminal
+        # still pending: one last proof attempt before reporting 124, so
+        # a standalone wait started after a cancel exits 2 here too.
+        # A read failure leaves the timeout standing.
         try:
-            h = gw.call_json("chat.history", body={"limit": 30, **scope})
-            replies = replies_after(h.get("chat_events", []), after_seq)
-        finally:
-            gw.close()
-    except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
-        log.warning("wait: could not read the final replies: %s", e)
+            latest = latest_user_seq(floor=FINAL_READ_FLOOR)
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            log.debug("failed-terminal check failed: %s", e)
+        else:
+            with wlock:
+                accepted = w.accept_replayed_failed(latest)
+            if accepted is not None:
+                kind, detail = accepted
+    replies = []
+    final_read_failed = False
+    for _try in range(2):  # one bounded retry on the final history read
+        try:
+            # Floored budget: the caller deadline may already have
+            # expired; without the floor the read collapses to a 0.1 s
+            # timeout the gateway reports as "no response" even when
+            # healthy (the idle-trial warnings in the 0.6.1 report).
+            replies = history_replies(floor=FINAL_READ_FLOOR)
+            final_read_failed = False
+            break
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            log.warning("wait: could not read the final replies: %s", e)
+            final_read_failed = True
+    if not final_read_failed and kind == "done" and not replies:
+        # Lag window: the reply may land just after the terminal status
+        # (the terminal is authority for done-ness, the read for content).
+        # Best-effort polls inside the caller deadline + floor; a reply
+        # that never lands still exits 0 after the window, and a failed
+        # poll ends the window without failing the done result (the
+        # primary final read already proved history readable).
+        # No `upto` freeze is applied: each read caps at the newest seq
+        # in its own window, so a reply landing after a settle read is
+        # picked up by the next settle retry or here. Freezing the bound
+        # at the first settle read would reintroduce the fast-turn loss
+        # (a reply landing after the freeze, before the terminal, would
+        # be excluded forever).
+        lag_until = time.monotonic() + LAG_WINDOW
+        while time.monotonic() < lag_until:
+            time.sleep(LAG_POLL)
+            try:
+                replies = history_replies(floor=0.1, cap=lag_until - time.monotonic())
+            except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+                log.debug("wait: lag-window read failed: %s", e)
+                break
+            if replies:
+                break
+    if final_read_failed and kind == "done":
+        # Replies cannot be proved: never exit 0 silently. Report a
+        # timeout (124) with a notice; the caller runs `wait` again.
+        log.warning("wait: final replies unreadable; reporting timeout instead of done")
+        kind, detail = "timeout", w.status
+    if w.boundary_unknown:
+        # The boundary was never read and no live running ever cleared
+        # it: no reply in history can be proved to be this turn's.
+        # Report the timeout with a notice, never stale replies.
+        replies = []
+        res_note = ("turn-end boundary unknown: history could not be read, "
+                    "so no replies are reported; run `muse-cli wait` again")
+    else:
+        res_note = None
     res = {"outcome": outcome_of(kind, replies), "status": w.status, "after_seq": after_seq,
            "final_text": replies[-1]["text"] if replies else None, "replies": replies}
+    if final_read_failed:
+        res["final_read_failed"] = True
+        res["note"] = "could not read the final replies; run `muse-cli wait` again"
+    elif res_note:
+        res["note"] = res_note
     if kind == "approval":
         res["approvals"] = detail
     if enabled:
