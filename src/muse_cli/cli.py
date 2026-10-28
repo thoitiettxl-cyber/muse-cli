@@ -1244,7 +1244,12 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
               auto_allow_once=None, check_every=None):
     """See _run_wait_inner. Any unexpected failure inside the wait is
     reported as a timeout (exit 124), never a traceback exit 1: the
-    exit-code contract is 0/2/4/124."""
+    exit-code contract is 0/2/4/124. AuthError is not unexpected: it is
+    re-raised so the caller (main() -> exit 2, the Telegram turn caller
+    -> "login expired, send /login") sees it; swallowing it as 124 would
+    send every "124 -> retry" agent into an infinite loop on expired
+    cookies. KeyboardInterrupt/SystemExit are BaseExceptions, so the
+    `except Exception` below never catches them."""
     import logging
     from .wait import EXIT_TIMEOUT
     log = log or logging.getLogger("muse_cli.wait")
@@ -1252,6 +1257,8 @@ def _run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fal
         return _run_wait_inner(cfg, thread, after_seq, timeout, require_running, on_event,
                                auto_approve, connector, approver, should_stop, recheck,
                                recheck_after, log, auto_allow_once, check_every)
+    except AuthError:
+        raise
     except Exception as e:  # noqa: BLE001 - the contract is exit codes, not tracebacks
         log.warning("wait: unexpected error (%s: %s); reporting timeout", type(e).__name__, e)
         return EXIT_TIMEOUT, {"outcome": "timeout", "status": None, "after_seq": after_seq,
