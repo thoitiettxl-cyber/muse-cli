@@ -181,8 +181,11 @@ not measured is marked unresolved.
 
 | Value | Meaning for `wait` |
 |---|---|
-| `completed`, root agent, `running` seen first | DONE (exit 0), after the history settle below |
+| `completed`, root agent, `running` seen first | DONE (exit 0) AT ONCE, no history proof: a live terminal after running ends the wait; the final replies are re-read from history afterwards |
 | `interrupted`, root agent, `running` seen first | FAILED (exit 2); no history proof required |
+| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; never accepted from a replay |
+| `completed`/`interrupted`/any terminal replayed BEFORE `running` was seen in this wait | Suspect: stored, settled against history (below); never ends the wait alone |
+| Terminal with a missing `root_agent_id` (absent, or a subagent id with no root id) | Suspect IN CODE, never a direct end — even after `running` was seen; settled against history only. The root id is learned ONLY from a root-confirmed `running` (a subagent's own `task.status` carries `agent_id == root_agent_id` with a DIFFERENT root value) |
 | `running`, root agent only | The only in-progress value; the only value that may set `seen_running` |
 | `pending_init` | Suspect, never progress, for any agent |
 | `idle`, `complete`, `done`, `finished`, `succeeded`, `success`, and every other DONE/FAILED-looking string | Suspect-and-require-settle: stored, settled against history, accepted only with history proof + root scope + `running` seen; with no proof the wait keeps waiting, never exits 0 empty |
@@ -190,12 +193,14 @@ not measured is marked unresolved.
 | Root terminal with `active_subagent_count > 0` | Suspect, re-check (provisional: one observation, non-root `completed` 4.532 s before root `completed`) |
 
 Scope: filter `agent_id == root_agent_id` when `root_agent_id` is present;
-a missing root id makes the event suspect. `sessions.updated` /
+a missing root id makes the event suspect IN CODE (see the table). `sessions.updated` /
 `tasks.updated` arrive on scoped subscribes and must never count as
 progress; scope-check every event kind by `session_id` when present.
 A fresh subscribe replays the last terminal state (`completed` on a fresh
 thread, `interrupted` after a cancel): a replay terminal alone never ends
-a wait — it needs `running` seen in this wait first.
+a wait — it needs `running` seen in this wait first, or history proof via
+settle. Settle never accepts FAILED: a standalone wait started AFTER a
+cancel times out (124) instead of exiting 2 — known limitation.
 
 ### History settle
 
@@ -211,7 +216,21 @@ replies even with empty text. `delta.presentation` and non-assistant
 events are excluded. Never use `transcript_revision` as a bound (observed
 constant 4993 against `seq_max` 4994, unresolved). Window: `limit=200`
 plus growth while `has_more` is set — `routes.json` has no cursor. The
-settled terminal is cleared only on a successful settle.
+settled terminal is cleared only on a successful settle. One settle
+attempt per (re)subscribe: a resubscribe retries the settle once with a
+fresh read; a deaf stream replaying the same terminal does not pay a
+history fetch per record.
+`upto` semantics (as implemented): each history read caps at the newest
+seq in ITS OWN window; there is NO freeze of the bound at the first
+settle read — freezing would reintroduce the fast-turn loss (a reply
+landing after the freeze, before the terminal, would be excluded
+forever). A reply landing after a settle read is picked up by the next
+resubscribe settle retry or by the final-read lag window: after a `done`
+terminal whose final read returns empty, history is polled for ~2 s
+before reporting done. The final history read has a floored 5 s budget
+independent of the expired caller deadline (a collapsed 0.1 s timeout is
+what the gateway reports as "no response" even when healthy); a final
+read FAILURE still fails closed to 124, never a silent exit 0.
 
 ### The `after_seq` boundary
 
@@ -221,9 +240,28 @@ caller-supplied `user_seq`), never from the latest event's seq: the old
 `limit=1` latest-event snapshot made `after_seq` equal the reply's own seq
 whenever the reply had already landed, excluding it forever (split
 send+wait: 11 exit 0 / 9 exit 124 over 20 turns, perfectly separated by
-completion time). If no user event is found, the boundary is 0 and the
-wait relies on terminal + scope checks. Integrated `send --wait` passes
-the delivery `user_seq` and was immune.
+completion time). When no user event is found, the boundary depends on
+WHY (see below): only a genuinely empty window yields 0. Integrated
+`send --wait` passes the delivery `user_seq` and was immune.
+
+Three cases are distinguished, and only the third yields boundary 0:
+
+- Read ERROR: each window read is retried once, bounded. If a window
+  succeeds, its result is used. If NO window ever succeeds, the
+  boundary is UNKNOWN, not 0: settle-from-replay is disabled until a
+  live root `running` is seen, and the wait reports timeout with a
+  notice rather than delivering stale replies. When a live `running`
+  is then seen, its event seq ratchets the boundary up (a reply to
+  this turn necessarily follows the running event).
+- Window EXHAUSTION (`has_more` still true at limit 1000, no user
+  event): the boundary is the max seq seen in any successful window
+  (the old snapshot behaviour), not 0.
+- Genuinely EMPTY (successful read, `has_more` false, no user event):
+  the boundary is 0. STALE RISK, documented: with boundary 0 the wait
+  relies on terminal + scope checks, and a stale reply already in
+  history can be delivered as this turn's if a replayed terminal
+  settles against it. The risk is confined to threads whose history
+  predates the wait with no user event in the window.
 
 ### Not turn signals
 
@@ -239,14 +277,43 @@ approval-pending `task.status` value (0 pending in 3 elicitation
 attempts); whether a decide can safely be retried after a lost reply
 (`_safe_to_repeat("egress.approval.decide")` is False, no idempotency key
 — never retry a decide blindly). `approvals.snapshot` carries no
-`session_id`, so approval filtering cannot be proved session-scoped.
+`session_id`, so approval filtering cannot be proved session-scoped:
+auto-approve may decide an approval Muse did not scope to this session.
+Expired-but-listed approvals are ignored (the waiter filters by
+`request_expires_at_ms`): a clock running ahead hides them — known
+limitation, no surfacing. A standalone wait started after a cancel
+times out (124) instead of exiting 2 (settle never accepts FAILED).
+Watermark granularity: a partially delivered batch retried by the
+monitor can duplicate the delivered part (per-item watermarking is a
+follow-up, not implemented). Same-path media in different turns can
+collide on the path-only dedup key (pre-existing). Single-flight
+`server_check` is a follow-up: bounding check threads would break the
+pinned property that a hung check never suppresses the next cadence
+check. A reply with no terminal ever still times out (124) by design
+(R4, Boss decision open). `transcript_revision` semantics unresolved.
 
 ### Wait constants (0.6.1)
 
 Watchdog 20 s without scoped progress (provisional — no progress-gap
-measurement supports tightening it); state-check budget 8 s (warm
-`task_state()` max 0.184 s over 5 calls, cold connect up to 3.272 s);
-reconnect budget 30 s as ONE shared monotonic deadline including connect
-+ Noise handshake; heartbeat 25 s; state check only on a suspected gap.
-Evidence-based hang bound: 20 + 30 + 5 = 55 s (arithmetic on the
-constants above, not a measured worst case).
+measurement supports tightening it); state-check budget 8 s subscribe
+(warm `task_state()` max 0.184 s over 5 calls, cold connect up to
+3.272 s); reconnect: each wait-path connect capped at 30 s
+(`connect_timeout=30` on `_wait_connection` → `bounded_connect`), the
+connect itself moved out from under `shared_lock` in `live()` so a slow
+handshake cannot serialise other threads, a storm of failed resubscribes
+switches to one bounded state check after 30 s, and resubscribe backoff
+sleeps are capped by the remaining caller deadline; heartbeat 25 s;
+state check only on a suspected gap; final history read floored at 5 s;
+lag window ~2 s after an empty `done` final read.
+Evidence-based hang bound: caller timeout + 65 s worst overshoot (30 s
+in-flight wait-path connect + 35 s final phase: 30 s connect + 5 s
+read; concurrent state checks do not delay the return, backoff cannot
+overshoot the deadline). A 20 s harness therefore ends by ~85 s, inside
+the 90 s Floor; the 35 s Target is unreachable by design (one hung
+connect alone can consume 30 s).
+
+M2 honesty: live terminal-to-exit latency is UNMEASURED post-fix. Do not
+cite the pre-fix exiting-subset numbers (median 0.469 s, p95 0.541 s,
+N=11) for the fixed code. The post-fix live evidence is 20/20 exit +
+exact replies on split send+wait — after_seq-fix evidence only, not a
+latency measurement.

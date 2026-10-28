@@ -180,12 +180,18 @@ muse-cli redeem <CODE>                # redeem a friend's invite code: one-time,
   connection before that (no raw fire-and-forget).
 - `wait` (and `send --wait/--until-done`) survive a connection that dies
   silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
-  replaces a dead connection and resubscribes under one shared 30 s deadline
-  (connect + Noise handshake), and checks the turn state on the server only
+  replaces a dead connection and resubscribes (each wait-path connect capped
+  at 30 s; a reconnect storm switches to one bounded state check after 30 s),
+  and checks the turn state on the server only
   when a gap is suspected (20 s without scoped progress, 8 s budget), so a
   turn that ended while the stream was deaf is reported at once with its
-  final replies. Only the root agent's `completed` (after `running`) ends a
-  turn; `interrupted` after `running` exits 2 with no history proof.
+  final replies. A live terminal after `running` ends a turn at once with no
+  history proof (a replayed or suspect terminal needs history proof);
+  `interrupted` after `running` exits 2 with no history proof;
+  `cancelled`/`canceled` are retained from the pre-existing cancel flow, not
+  live-measured, and a standalone wait started after a cancel times out
+  instead of exiting 2. Approvals carry no session id, so auto-approve may
+  decide an approval Muse did not scope to this session.
   Reconnects are quiet; only after about a minute without Muse does stderr
   get one `wait: can't reach Muse`
   line (and `wait: reconnected` when it is back). Exit codes are unchanged.

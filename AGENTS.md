@@ -36,12 +36,16 @@
   connection before that (no raw fire-and-forget).
 - `wait` (and `send --wait/--until-done`) survive a connection that dies
   silently: a heartbeat pings the gateway every 25 s when nothing has arrived,
-  replaces a dead connection and resubscribes under one shared 30 s deadline
-  (connect + Noise handshake), and checks the turn state on the server only
-  when a gap is suspected (20 s without scoped progress, 8 s budget), so a
-  turn that ended while the stream was deaf is reported at once with its
-  final replies. Only the root agent's `completed` (after `running`) ends a
-  turn; `interrupted` after `running` exits 2 with no history proof.
+  replaces a dead connection and resubscribes (each wait-path connect capped
+  at 30 s; a reconnect storm switches to one bounded state check after 30 s),
+  and checks the turn state on the server only when a gap is suspected
+  (20 s without scoped progress, 8 s budget), so a turn that ended while the
+  stream was deaf is reported at once with its final replies. A live terminal
+  after `running` ends a turn at once with no history proof (a replayed or
+  suspect terminal needs history proof); `interrupted` after `running` exits
+  2 with no history proof; `cancelled`/`canceled` are retained from the
+  pre-existing cancel flow, not live-measured, and a standalone wait started
+  after a cancel times out instead of exiting 2.
   Reconnects are quiet; only after
   about a minute without Muse does stderr get one `wait: can't reach Muse`
   line (and `wait: reconnected` when it is back). Exit codes are unchanged.
@@ -86,7 +90,9 @@ the warning names its title, kind, scope and offered options. If the
 monitor and a turn present the same approval at once, the second caller
 waits up to 15 seconds for the in-flight claim to resolve instead of
 ending the turn as `needs_approval`; if the claim fails or times out,
-the second caller decides it itself.
+the second caller decides it itself. Approvals carry no session id
+(`approvals.snapshot` has none), so auto-approve may decide an approval
+Muse did not scope to this session.
 
 ```bash
 muse-cli auto-approve status   # {"auto_approve": "always"|"off", "auto_allow_once": true|false, ...}
