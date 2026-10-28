@@ -10,6 +10,7 @@ import time
 from . import cli
 from .cli import cmd_auth_export, connect, fmt_event, load_config
 from .gateway import AuthError, GatewayError
+from .wait import is_self_referential
 
 WAIT = 300   # seconds to wait for the first reply
 QUIET = 10   # seconds of silence after a reply before taking the next message
@@ -80,9 +81,11 @@ class Chat:
         found = []
         for ev in self.events(15):
             p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-            # Exclude background updates (same discriminator as cli.is_reply):
-            # events with reply_to_message_id are not genuine replies
-            if ev.get("reply_to_message_id") or p.get("reply_to_message_id"):
+            # Exclude proactive pushes (background updates): only a
+            # self-referential reply_to marks one, the same rule as
+            # wait.replies_after and cli.is_reply. A reply_to pointing at
+            # another message is a genuine reply and is kept.
+            if is_self_referential(ev)[0]:
                 continue
             if (ev.get("event_name") == "message.assistant" and ev.get("seq", 0) > after
                     and p.get("status") and fmt_event(ev)["text"]):

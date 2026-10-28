@@ -56,9 +56,13 @@ chat / feed / goals / ideas / sessions / ...
   top-level and `payload.display_text`, and are the source of truth.
 - Genuine assistant replies may carry a `reply_to_message_id` pointing at
   the message they answer; proactive pushes (Telegram drafts, background
-  task updates) are self-referential there: `reply_to_message_id` equals
-  the message's own `message_id` (at the event or the payload level).
-  Only that exact match drops a reply — an empty `reply_to_message_id`
+  task updates) are self-referential there: `reply_to_message_id` (at the
+  event or the payload level) equals the message's own id. Observed live,
+  that id is the bare execution id: `message_id` is
+  `assistant-msg-<execution id>` and `reply_to_message_id` is
+  `<execution id>`, or `payload.metadata.root_message_execution_id` for
+  the 2nd+ message of one push (never the literal `message_id`).
+  Only such a self-reference drops a reply — an empty `reply_to_message_id`
   is not required. That is how `send` tells a reply apart from
   background chatter.
 - Live `chat.subscribe` events use **different shapes** (`delta.text_append`
@@ -215,7 +219,9 @@ root id — the wait times out (124) instead of exiting 2.
 A history event counts as a delivered reply only if ALL hold:
 `event_name = message.assistant`, `payload.status` exactly `completed`,
 `reply_to_message_id` (event or payload level) NOT equal to the
-message's own `message_id` (a self-referential event is a proactive push;
+message's own id: its `message_id`, that id without the
+`assistant-msg-` prefix, or `payload.metadata.root_message_execution_id`
+(a self-referential event is a proactive push;
 a `reply_to` pointing at another id is kept),
 `seq > after_seq`, `seq <=` the newest seq in the window of the history
 read that produced it (each read caps at its own window; the bound is

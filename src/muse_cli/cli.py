@@ -930,13 +930,14 @@ def is_reply(ev, baseline):
     """True for a genuine assistant reply (not a proactive push).
 
     Proactive pushes (Telegram drafts, background task updates) are
-    self-referential: reply_to_message_id equals the message's own id.
-    A genuine reply may carry reply_to pointing at the message it
-    answers, so only an exact match drops it — the same rule as
+    self-referential: reply_to_message_id equals the message's own id
+    (see wait.is_self_referential for the live id forms). A genuine reply
+    may carry reply_to pointing at the message it answers, so only a
+    self-reference drops it — the same rule as
     replies_after (see wait.is_self_referential, pinned by test
     test_is_reply_agrees_with_replies_after). Note: is_reply is
-    currently uncalled in src (only a comment in chat.py references
-    it); it is kept, fixed, and tested so the two reply filters cannot
+    currently uncalled in src (chat.new_replies uses the same helper);
+    it is kept, fixed, and tested so the two reply filters cannot
     drift apart silently."""
     if ev.get("event_name") != "message.assistant":
         return False

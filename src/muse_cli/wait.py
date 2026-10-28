@@ -419,6 +419,9 @@ class Waiter:
         return self.result
 
 
+_ASSISTANT_PREFIX = "assistant-msg-"
+
+
 def is_self_referential(ev):
     """Return (True, level, matched_id) when the event's reply_to_message_id
     (event level or payload level) equals the message's OWN id, or
@@ -430,10 +433,27 @@ def is_self_referential(ev):
     and must be kept. When the event and payload ids differ, a match to
     either own id drops it. When no id exists at either level,
     self-reference cannot be proved and the event is kept (fail open).
-    No payload field beyond the evidenced message_id /
-    reply_to_message_id is read here."""
+    "Own id" covers the live forms: the message_id itself, the message_id
+    without its "assistant-msg-" prefix, and payload.metadata
+    .root_message_execution_id (a push's 2nd+ message points at its
+    execution root). Observed on the default muse.ai VM: all 17 pushes
+    with a reply_to in a 300-event window matched one of these, none
+    matched the bare message_id."""
     p = _payload(ev)
-    own = [mid for mid in (p.get("message_id"), ev.get("message_id")) if mid]
+    own = set()
+    for mid in (p.get("message_id"), ev.get("message_id")):
+        if mid:
+            own.add(mid)
+            # Live shape (muse.ai history): message_id is
+            # "assistant-msg-<execution id>" while a push's reply_to is the
+            # bare execution id, so the prefix is stripped for the match.
+            if isinstance(mid, str) and mid.startswith(_ASSISTANT_PREFIX):
+                own.add(mid[len(_ASSISTANT_PREFIX):])
+    meta = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
+    if meta.get("root_message_execution_id"):
+        # Later messages of one push execution point at the execution's
+        # root id, which differs from their own message_id suffix.
+        own.add(meta["root_message_execution_id"])
     for level, ref in (("event", ev.get("reply_to_message_id")),
                        ("payload", p.get("reply_to_message_id"))):
         if ref and ref in own:
