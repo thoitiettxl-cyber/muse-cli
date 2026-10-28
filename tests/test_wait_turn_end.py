@@ -190,6 +190,101 @@ def test_task_status_info_reports_scope():
     assert suspect is not None and suspect["root_confirmed"] is False
 
 
+# -- Fix round: root learning only from root-confirmed running ---------------
+
+def test_subagent_own_root_terminal_first_does_not_teach_root():
+    """A subagent's own task.status (agent_id == its own root_agent_id,
+    a DIFFERENT root value) arriving first must not teach the waiter
+    that root: the main turn still has to run and end."""
+    w = Waiter()
+    assert w.feed(ts("completed", agent_id=SUB, root_agent_id=SUB)) is None
+    assert w.root_id is None
+    assert w.feed(ts("running")) is None
+    assert w.root_id == ROOT and w.seen_running is True
+    assert w.feed(ts("completed")) == ("done", "completed")
+
+
+def test_missing_root_terminal_after_confirmed_running_requires_settle():
+    """A terminal with root_agent_id=None after confirmed running is
+    suspect, never a direct end: it needs history proof."""
+    w = Waiter()
+    assert w.feed(ts("running")) is None
+    assert w.feed(ts("completed", root_agent_id=None)) is None
+    assert w.result is None
+    assert w.ignored_terminal == "completed"
+    assert w.settle([]) is None
+    assert w.settle(REPLY) == ("done", "completed")
+
+
+def test_rootless_completed_never_ends_directly():
+    """A terminal with NO root_agent_id key at all is suspect too."""
+    w = Waiter()
+    assert w.feed(ts("running")) is None
+    ev = ts("completed")
+    del ev["payload"]["root_agent_id"]
+    assert w.feed(ev) is None
+    assert w.result is None
+    assert w.settle(REPLY) == ("done", "completed")
+
+
+def test_subagent_id_without_root_is_suspect():
+    w = Waiter()
+    assert w.feed(ts("running")) is None
+    assert w.feed(ts("completed", agent_id=SUB, root_agent_id=None)) is None
+    assert w.result is None
+    assert w.settle(REPLY) == ("done", "completed")
+
+
+def test_different_root_running_does_not_overwrite_learned_root():
+    """Once the root is learned from a root-confirmed running, another
+    agent's root-confirmed running neither overwrites it nor ends the
+    wait through its own terminal."""
+    w = Waiter(require_running=True)
+    assert w.feed(ts("running")) is None
+    assert w.feed(ts("running", agent_id="other", root_agent_id="other")) is None
+    assert w.root_id == ROOT and w.seen_running is True
+    assert w.feed(ts("completed", agent_id="other", root_agent_id="other")) is None
+    assert w.result is None
+    assert w.feed(ts("completed")) == ("done", "completed")
+
+
+def test_subagent_count_zero_rearms_suspect_terminal():
+    """F8: a later record showing active_subagent_count == 0 re-arms a
+    terminal stored while subagents ran, so the next settle may accept
+    it without waiting for another running event."""
+    w = Waiter()
+    assert w.feed(ts("running", active_subagent_count=1)) is None
+    assert w.feed(ts("completed", active_subagent_count=1)) is None
+    assert w.ignored_reason == "subagents"
+    assert w.settle(REPLY) is None
+    assert w.feed(ts("queued", active_subagent_count=0)) is None
+    assert w.ignored_reason is None
+    assert w.settle(REPLY) == ("done", "completed")
+
+
+def test_boundary_unknown_blocks_settle_until_live_running():
+    """Fix 1 (Waiter half): when the history boundary could not be read,
+    a replayed terminal must not settle until a live root running is
+    seen; the running event clears the block."""
+    w = Waiter()
+    w.boundary_unknown = True
+    assert w.feed(ts("completed")) is None
+    assert w.settle(REPLY) is None
+    assert w.feed(ts("running")) is None
+    assert w.boundary_unknown is False
+    assert w.feed(ts("completed")) == ("done", "completed")
+
+
+def test_replies_after_warns_on_dropped_statusless_text(caplog):
+    """F15: a text-bearing assistant event dropped for lacking
+    payload.status='completed' is warn-logged, not lost silently."""
+    import logging
+    evs = [hist(10, "lost words?", status=None)]
+    with caplog.at_level(logging.WARNING, logger="muse_cli.wait"):
+        assert replies_after(evs, 0) == []
+    assert "dropping" in caplog.text and "10" in caplog.text
+
+
 # -- D4 history settle / reply filtering ------------------------------------
 
 def test_replies_after_requires_status_and_empty_reply_to():

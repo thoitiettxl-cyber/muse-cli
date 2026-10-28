@@ -25,12 +25,12 @@ log = logging.getLogger("muse_cli.wait")
 
 # Proven on muse01 (N=30 turns completed, N=2 cancels interrupted). Every
 # other string is suspect: it may end the wait only with history proof.
-# `cancelled`/`canceled` are retained as proven FAILED from the
-# pre-existing cancel flow (a chat.cancel is confirmed by the server with
-# one of these strings; see test_stop_during_turn): muse01 never observed
-# them, so they are NOT muse01-measured, but dropping them would leave a
-# stopped turn waiting until its timeout. They still need running-seen
-# and never settle from a replay.
+# `cancelled`/`canceled` are RETAINED as FAILED from the pre-existing
+# cancel flow (the base FAILED set below, plus the tgbot.py comment "The
+# turn ends on Muse's cancelled status"): muse01 never observed them, so
+# they are NOT muse01-measured, but dropping them would leave a stopped
+# turn waiting until its timeout. They still need running-seen and never
+# settle from a replay.
 DONE = {"completed"}
 FAILED = {"interrupted", "cancelled", "canceled"}
 SUSPECT_DONE = {"idle", "complete", "done", "finished", "succeeded", "success"}
@@ -79,6 +79,7 @@ def task_status_info(ev, thread=None):
     s = p.get("status")
     return {"status": str(s).lower() if s else None,
             "root_confirmed": bool(root and agent == root),
+            "root_agent_id": root, "agent_id": agent,
             "active_subagent_count": p.get("active_subagent_count")}
 
 
@@ -239,7 +240,13 @@ class Waiter:
         self.ignored_terminal = None
         self.ignored_reason = None  # "subagents" when the root terminal arrived
         # while subagents were still running: settle must not accept it.
-        self.root_id = None  # learned from the first scoped task.status
+        self.root_id = None  # learned ONLY from a root-confirmed `running`
+        # (a subagent's own task.status carries agent_id == its own
+        # root_agent_id, a different root value: learning from any
+        # passing task.status would learn the wrong root)
+        self.boundary_unknown = False  # history boundary unreadable: no
+        # settle-from-replay until a live root `running` is seen
+        self.running_seq = None  # seq of the first root-confirmed running
 
     def _expired(self, described):
         exp = described.get("expires_at_ms")
@@ -293,31 +300,46 @@ class Waiter:
         info = task_status_info(ev, self.thread)
         if info is None or not info["status"]:
             return None
-        # Learn the root agent's id from the first scoped task.status; a
-        # terminal from a different root (another agent sharing the
-        # session scope) is not this turn.
-        root = _payload(ev).get("root_agent_id")
-        if root:
-            if self.root_id is None:
-                self.root_id = root
-            elif root != self.root_id:
-                return None
+        root = info["root_agent_id"]
+        # F8: a later record showing no subagents running re-arms a
+        # terminal stored while subagents ran (the terminal itself is
+        # kept; only its "subagents" reason is cleared, so the next
+        # settle may accept it).
+        if (self.ignored_reason == "subagents"
+                and info["active_subagent_count"] == 0):
+            self.ignored_reason = None
         s = info["status"]
         if s == "running":
             if info["root_confirmed"]:
-                self.seen_running = True
-                self.ignored_terminal = None
-                self.ignored_reason = None
+                if self.root_id is None:
+                    self.root_id = root
+                if root == self.root_id:
+                    self.seen_running = True
+                    self.ignored_terminal = None
+                    self.ignored_reason = None
+                    self.boundary_unknown = False
+                    if self.running_seq is None:
+                        self.running_seq = ev.get("seq")
             self.status = s
             return None
         if s not in TERMINAL:
             return None  # queued/starting/working/pending_init: never progress
+        # A terminal from a different root (another agent sharing the
+        # session scope) is not this turn; it teaches nothing.
+        if self.root_id is not None and root and root != self.root_id:
+            return None
         self.status = s
         if info["active_subagent_count"]:
             # Root says done while subagents still run (muse01: a subagent
             # `completed` arrived 4.5 s before the root's): suspect, re-check.
             self.ignored_terminal = s
             self.ignored_reason = "subagents"
+            return None
+        if not info["root_confirmed"]:
+            # Missing root id (absent, or a subagent id with no root id):
+            # suspect, never a direct end. Settle decides with history.
+            self.ignored_terminal = s
+            self.ignored_reason = "missing_root"
             return None
         if s in DONE or s in FAILED:
             if self.seen_running:
@@ -342,6 +364,11 @@ class Waiter:
         s = self.ignored_terminal
         if self.result is not None or not s:
             return None
+        if self.boundary_unknown:
+            # The history boundary could not be read: a history proof
+            # cannot be trusted not to be stale. Disabled until a live
+            # root `running` clears the flag (see feed).
+            return None
         if self.ignored_reason == "subagents" or s in FAILED:
             return None
         if not replies:
@@ -364,6 +391,7 @@ def replies_after(events, after_seq, upto=None):
     media or an unanswered widget (media=True)."""
     out = []
     seen = set()
+    dropped = []
     for e in sorted(events, key=lambda e: e.get("seq") or 0):
         if not isinstance(e, dict):
             continue
@@ -374,6 +402,11 @@ def replies_after(events, after_seq, upto=None):
             continue
         p = _payload(e)
         if p.get("status") != "completed":
+            # Text-bearing events dropped for lacking a completed status
+            # are logged, not lost silently (F15): a status-less partial
+            # must be visible in the log when a wait reports no reply.
+            if p.get("display_text") or p.get("content") or e.get("display_text"):
+                dropped.append(seq)
             continue
         if e.get("reply_to_message_id") or p.get("reply_to_message_id"):
             continue
@@ -392,6 +425,10 @@ def replies_after(events, after_seq, upto=None):
         if has_media:
             r["media"] = True
         out.append(r)
+    if dropped:
+        log.warning("replies_after: dropping %d text-bearing assistant event(s) "
+                    "without payload.status='completed' (seqs %s)",
+                    len(dropped), dropped)
     return out
 
 
