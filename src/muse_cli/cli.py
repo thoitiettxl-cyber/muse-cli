@@ -1386,7 +1386,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
                 return out
         return out
 
-    def latest_user_seq():
+    def latest_user_seq(floor=0.1):
         """Max message.user seq in a history window, or None when no user
         event is found. The window grows exactly like history_replies
         (200/500/1000 while has_more and the oldest event is still newer
@@ -1397,12 +1397,14 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         on the next record; None is a proved answer (no user event in
         the window), not a failure. Used only to prove a replayed FAILED
         terminal belongs to the boundary turn (see
-        Waiter.accept_replayed_failed)."""
+        Waiter.accept_replayed_failed). FLOOR is the minimum budget for
+        one read, as in history_replies (the last-chance check at timeout
+        passes FINAL_READ_FLOOR)."""
         seen = None
         for lim in HISTORY_LIMITS:
             g = conn(cfg)
             try:
-                budget = max(0.1, deadline - time.monotonic())
+                budget = max(floor, deadline - time.monotonic())
                 kw = {"body": {"limit": lim, **scope}, "timeout": budget}
                 if hasattr(g, "_retry"):  # SharedConn: retries respect the deadline
                     kw["_deadline"] = time.monotonic() + budget
@@ -1474,10 +1476,13 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         return seen_max, True
 
     boundary_known = True
-    if after_seq is None:
+    derived = after_seq is None
+    if derived:
         after_seq, boundary_known = derive_after_seq()
     w = Waiter(thread=thread, require_running=require_running, approver=approver)
     w.boundary_unknown = not boundary_known
+    w.after_seq = after_seq
+    w.boundary_derived = derived and boundary_known
 
     def ratchet_boundary():
         """When the boundary was never read, a live root `running` is the
@@ -1488,6 +1493,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         nonlocal after_seq
         if not boundary_known and w.running_seq is not None and w.running_seq > after_seq:
             after_seq = w.running_seq
+            w.after_seq = after_seq
 
     body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
     user_stop = should_stop or (lambda: False)
@@ -1721,7 +1727,7 @@ def _run_wait_inner(cfg, thread=None, after_seq=None, timeout=600, require_runni
         # a standalone wait started after a cancel exits 2 here too.
         # A read failure leaves the timeout standing.
         try:
-            latest = latest_user_seq()
+            latest = latest_user_seq(floor=FINAL_READ_FLOOR)
         except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
             log.debug("failed-terminal check failed: %s", e)
         else:

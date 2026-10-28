@@ -250,6 +250,11 @@ class Waiter:
         self.boundary_unknown = False  # history boundary unreadable: no
         # settle-from-replay until a live root `running` is seen
         self.running_seq = None  # seq of the first root-confirmed running
+        # The wait's boundary, and whether it was derived from history (a
+        # standalone wait) rather than given by the caller: only a derived
+        # boundary lets a replayed cancel end the wait (accept_replayed_failed).
+        self.after_seq = None
+        self.boundary_derived = False
 
     def _expired(self, described):
         exp = described.get("expires_at_ms")
@@ -389,28 +394,32 @@ class Waiter:
         return self.result
 
     def accept_replayed_failed(self, latest_user_seq):
-        """Exit 2 for a replayed FAILED terminal that belongs to the
-        boundary turn: the wait started after a cancel, and the terminal
-        is the end of the turn after `after_seq`.
+        """Exit 2 for a replayed FAILED terminal that provably ends the
+        awaited turn: a standalone wait started after a cancel.
 
-        "Belongs to the boundary turn" is proved from evidence available
-        at wait start: the terminal was root-confirmed (ignored_reason is
-        None, so not missing-root/subagents-suspect), the boundary is
-        known, the terminal record carries a seq, and no message.user
-        event is newer than that seq (latest_user_seq <= terminal seq).
-        A FAILED terminal from an older turn (a newer user event exists,
-        or the terminal seq is unknown) must NOT exit 2: it returns None
-        and the wait keeps waiting for the live turn. SUSPECT_FAILED
-        strings are never accepted here (unmeasured vocabulary); they
-        stay on the settle path, which also refuses FAILED. Exits with
-        0 replies: a cancelled turn's partials are never final replies."""
+        Proof, all required:
+        - the terminal is FAILED (not SUSPECT_FAILED) and root-confirmed
+          (ignored_reason None: not missing-root/subagents-suspect);
+        - the boundary was DERIVED from history (boundary_derived: a
+          standalone `wait`, no explicit --after-seq). An explicit
+          boundary (`wait --after-seq`, `send --wait`, the Telegram
+          follower) names a turn that may not have started yet, so a
+          replayed cancel cannot be proved to be its own: never accepted;
+        - the boundary is known and LATEST_USER_SEQ == after_seq: no user
+          message newer than the boundary exists.
+        The replayed task.status seq is never used: live it is a stream
+        counter (e.g. 5988 while chat.history seqs were ~5196), not a
+        chat seq, and the event carries no turn marker (task_id is agent
+        identity). Exits with 0 replies: a cancelled turn's partials are
+        never final replies."""
         s = self.ignored_terminal
         if self.result is not None or not s or s not in FAILED:
             return None
         if self.boundary_unknown or self.ignored_reason is not None:
             return None
-        tseq = self.ignored_terminal_seq
-        if tseq is None or latest_user_seq is None or latest_user_seq > tseq:
+        if not self.boundary_derived or self.after_seq is None:
+            return None
+        if latest_user_seq is None or latest_user_seq != self.after_seq:
             return None
         self.ignored_terminal = None
         self.ignored_reason = None

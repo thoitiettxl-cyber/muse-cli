@@ -133,8 +133,9 @@ def test_replayed_interrupted_after_boundary_turn_exits_2(world, monkeypatch):
     monkeypatch.setattr(cli, "RESUB_PAUSE", 0.05)
     monkeypatch.setattr(conn.Muse, "HEARTBEAT", 0.2)
     w.state = "interrupted"
-    w.term_seq = AFTER + 1  # terminal after the boundary user message
-    (code, res), secs = run(w, timeout=5, check_every=0)
+    w.term_seq = AFTER + 1  # stream seq: never compared with chat seqs
+    # standalone: the boundary (AFTER, the latest user message) is derived
+    (code, res), secs = run(w, timeout=5, check_every=0, after_seq=None)
     assert code == 2 and res["outcome"] == "failed"
     assert res["replies"] == []
     assert secs < 4
@@ -229,12 +230,13 @@ def test_replayed_failed_with_missing_root_id_does_not_exit_2(world, monkeypatch
 
 def test_waiter_accept_replayed_failed_unit():
     """Waiter-level rule: FAILED + root-confirmed + reason clear + boundary
-    known + terminal after the latest user message -> exit 2."""
+    derived from history and known + no user message newer than it -> exit 2."""
     w = Waiter()
     w.feed({"event": "task.status", "seq": 10, "payload": {
         "status": "interrupted", "agent_id": "r", "root_agent_id": "r",
         "is_thread": False, "session_id": None}})
     assert w.ignored_terminal == "interrupted"
+    w.boundary_derived, w.after_seq = True, 9
     assert w.accept_replayed_failed(9) == ("failed", "interrupted")
     assert w.result == ("failed", "interrupted")
 
@@ -244,6 +246,7 @@ def test_waiter_accept_replayed_failed_rejects_stale_and_unknown():
     w.feed({"event": "task.status", "seq": 10, "payload": {
         "status": "interrupted", "agent_id": "r", "root_agent_id": "r",
         "is_thread": False, "session_id": None}})
+    w.boundary_derived, w.after_seq = True, 9
     assert w.accept_replayed_failed(11) is None  # newer user turn exists
     assert w.result is None
     w.boundary_unknown = True
