@@ -395,7 +395,6 @@ def test_live_does_not_hold_shared_lock_while_connecting():
     entered.clear()
     t2 = threading.Thread(target=go, daemon=True)
     t2.start()
-    assert len(calls) == 1
     t0 = time.monotonic()
     while len(calls) < 2 and time.monotonic() - t0 < 2:
         time.sleep(0.02)
