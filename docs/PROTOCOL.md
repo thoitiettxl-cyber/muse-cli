@@ -191,7 +191,7 @@ not measured is marked unresolved.
 |---|---|
 | `completed`, root agent, `running` seen first | DONE (exit 0) AT ONCE, no history proof: a live terminal after running ends the wait; the final replies are re-read from history afterwards |
 | `interrupted`, root agent, `running` seen first | FAILED (exit 2); no history proof required |
-| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; accepted from a replay only via the boundary-turn proof (`accept_replayed_failed`), never from a replay without it |
+| `cancelled`/`canceled`, root agent, `running` seen first | FAILED (exit 2), RETAINED from the pre-existing cancel flow (base FAILED set + the tgbot.py comment "The turn ends on Muse's cancelled status"), NOT muse01-measured; accepted from a replay only by a standalone wait via `accept_replayed_failed` (derived boundary, no newer user message), never by an explicit `--after-seq` wait |
 | `completed`/`interrupted`/any terminal replayed BEFORE `running` was seen in this wait | Suspect: stored, settled against history (below); a replayed `completed` never ends the wait alone, and a replayed FAILED ends it only via the boundary-turn proof |
 | Terminal with a missing `root_agent_id` (absent, or a subagent id with no root id) | Suspect IN CODE, never a direct end — even after `running` was seen; settled against history only. The root id is learned ONLY from a root-confirmed `running` (a subagent's own `task.status` carries `agent_id == root_agent_id` with a DIFFERENT root value) |
 | `running`, root agent only | The only in-progress value; the only value that may set `seen_running` |
@@ -208,11 +208,21 @@ A fresh subscribe replays the last terminal state (`completed` on a fresh
 thread, `interrupted` after a cancel): a replayed `completed` terminal
 alone never ends a wait — it needs `running` seen in this wait first, or
 history proof via settle. Settle never accepts FAILED; instead a
-replayed FAILED terminal exits 2 via `accept_replayed_failed` when it is
-proved to belong to the boundary turn (root-confirmed, boundary known,
-terminal seq present, no `message.user` event newer than the terminal
-seq). When that proof fails — no seq, a newer user event, or a missing
-root id — the wait times out (124) instead of exiting 2.
+replayed FAILED terminal exits 2 via `accept_replayed_failed` only for a
+standalone wait: root-confirmed, the boundary DERIVED from history (no
+explicit `--after-seq`) and known, and the latest `message.user` seq
+equal to that boundary (no newer user message). The replayed
+`task.status` seq is never used: live it is a stream counter that grows
+on every subscribe (observed 5988, 5991, 5994 while chat.history seqs
+were ~5196), not a chat seq, and the event carries no turn marker
+(`task_id` is agent identity). An explicit boundary (`wait --after-seq`,
+`send --wait`, the Telegram follower) names a turn that may not have
+started yet, so a replayed cancel there is never failure: the wait keeps
+waiting (124 at its timeout). New in 0.6.1: 0.6.0 returned 124 for a
+standalone wait after a cancel (it did not know `interrupted`).
+Residual: a standalone wait started after a cancel AND a new message
+whose turn has not started yet takes that new message as its boundary
+and exits 2 from the older cancel.
 
 ### History settle
 
@@ -299,9 +309,8 @@ auto-approve may decide an approval Muse did not scope to this session.
 Expired-but-listed approvals are ignored (the waiter filters by
 `request_expires_at_ms`): a clock running ahead hides them — known
 limitation, no surfacing. A standalone wait started after a cancel
-exits 2 only when the replayed FAILED terminal is proved to belong to
-the boundary turn (see the replay paragraph above); when the proof
-fails it times out (124).
+exits 2 (see the replay paragraph above); an explicit `--after-seq`
+wait never treats a replayed, older cancel as failure.
 Monitor forwarding delay: `sessions.updated` never counts as scoped
 progress (pinned by test_monitor_scoped_progress_and_watchdog — the
 records arrive on scoped subscribes for other sessions too, and the

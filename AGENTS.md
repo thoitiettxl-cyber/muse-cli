@@ -52,16 +52,17 @@
   `completed` or suspect terminal needs history proof); `interrupted`
   after `running` exits 2 with no history proof; `cancelled`/`canceled`
   are retained from the pre-existing cancel flow, not live-measured.
-  A standalone wait started after a cancel exits 2 when the replayed
-  FAILED terminal is proved to belong to the boundary turn (root-
-  confirmed, terminal seq present, no newer user event); when the proof
-  fails it times out (124) instead.
+  A standalone `wait` (no `--after-seq`) started after a cancel exits 2
+  (new in 0.6.1; 0.6.0 returned 124): the replayed `interrupted` is
+  accepted only when the boundary was read from history and no user
+  message is newer than it. An explicit `--after-seq` wait (and `send
+  --wait`, the Telegram bot) never treats a replayed, older cancel as
+  failure; it keeps waiting (124 at its timeout).
   Reconnects are quiet; only after
   about a minute without Muse does stderr get one `wait: can't reach Muse`
   line (and `wait: reconnected` when it is back). Exit codes are 0/2/4/124
-  as listed below; the replayed-FAILED exit 2 above is the 0.6.0
-  behaviour, restored — a wait that cannot prove the terminal belongs
-  to the boundary turn still reports 124.
+  as listed below; the standalone-wait-after-cancel exit 2 above is new
+  in 0.6.1 (0.6.0 reported 124 there).
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
   `4` needs a human: a question in the final reply (widget or plain text,
