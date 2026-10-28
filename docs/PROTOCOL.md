@@ -217,8 +217,9 @@ A history event counts as a delivered reply only if ALL hold:
 `reply_to_message_id` (event or payload level) NOT equal to the
 message's own `message_id` (a self-referential event is a proactive push;
 a `reply_to` pointing at another id is kept),
-`seq > after_seq`, `seq <=` the upper bound captured at terminal /
-state-check time. Dedup by (`seq`, `message_id`). `interrupted`-status
+`seq > after_seq`, `seq <=` the newest seq in the window of the history
+read that produced it (each read caps at its own window; the bound is
+not frozen at the first settle read). Dedup by (`seq`, `message_id`). `interrupted`-status
 assistant events are partials (two observed, 1998/2464 chars) and are
 excluded from replies, while the `interrupted` terminal itself needs no
 history proof. Media/widget-carrying completed assistant events count as
@@ -357,8 +358,11 @@ reconnect-storm state check (8 s budget, synchronous in the wait loop
 via `note_failure`) runs before the caller deadline in the normal case
 and adds nothing to that overshoot; in the pathological case where it
 starts just before the deadline it can add up to 8 s to the elapsed
-overshoot (up to 104 s on timeouts longer than 30 s — unreachable on a
-20 s harness, where the storm switch cannot fire before the deadline). The
+overshoot, so the overshoot can reach 84 s (67 s + ~9 s close + 8 s) in
+the storm-straddle case — only on timeouts longer than 30 s, since the
+storm switch needs 30 s of failures, and unreachable on a 20 s harness,
+where the storm switch cannot fire before the deadline. Absolute elapsed
+is caller timeout + overshoot (e.g. 144 s on a 60 s timeout). The
 35 s Target is unreachable by design (one hung connect alone can
 consume 30 s). Concurrent state checks do not delay the return, and
 backoff cannot overshoot the deadline.
