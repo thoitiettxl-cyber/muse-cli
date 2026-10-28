@@ -5,7 +5,8 @@ Seams under test: Waiter.feed/settle and replies_after in muse_cli.wait
 Expected values come from the muse01 measurements in
 ~/workspace/tmp/muse-cli-wait-design/2b-probe-results-muse01.md, not from
 the implementation: DONE=completed only (N=30 turns), FAILED=interrupted
-only (N=2 cancels), running is the only in-progress value, pending_init
+only muse01-measured (N=2 cancels) plus cancelled/canceled retained from
+the pre-existing cancel flow, running is the only in-progress value, pending_init
 never progresses. (The first T10 report, 2-probe-results.md, is polluted
 by the default/self profile and must not be cited.)
 """
@@ -47,7 +48,9 @@ REPLY = [hist(10, "final reply")]
 
 def test_proven_vocabulary_sets():
     assert DONE == {"completed"}
-    assert FAILED == {"interrupted"}
+    # interrupted is muse01-measured; cancelled/canceled are retained from
+    # the pre-existing cancel flow (not muse01-measured, see wait.py).
+    assert FAILED == {"interrupted", "cancelled", "canceled"}
 
 
 def test_completed_without_running_never_ends_wait_alone():
@@ -132,6 +135,24 @@ def test_interrupted_without_running_never_settles():
     assert w.result is None
 
 
+@pytest.mark.parametrize("s", ["cancelled", "canceled"])
+def test_cancelled_after_running_is_failed_without_history(s):
+    """The /stop confirm: a cancel string after running ends the wait as
+    failed at once (retained vocabulary, not muse01-measured)."""
+    w = Waiter(require_running=True)
+    assert w.feed(ts("running")) is None
+    assert w.feed(ts(s)) == ("failed", s)
+    assert exit_code("failed") == 2
+
+
+@pytest.mark.parametrize("s", ["cancelled", "canceled"])
+def test_cancelled_without_running_never_settles(s):
+    w = Waiter()
+    assert w.feed(ts(s)) is None
+    assert w.settle(REPLY) is None
+    assert w.result is None
+
+
 @pytest.mark.parametrize("s", ["idle", "done", "finished", "succeeded", "success", "complete"])
 def test_suspect_done_strings_require_history_proof(s):
     w = Waiter()
@@ -141,8 +162,8 @@ def test_suspect_done_strings_require_history_proof(s):
     assert w.settle(REPLY) == ("done", s)
 
 
-@pytest.mark.parametrize("s", ["failed", "failure", "error", "errored", "cancelled",
-                               "canceled", "aborted", "timed_out"])
+@pytest.mark.parametrize("s", ["failed", "failure", "error", "errored",
+                               "aborted", "timed_out"])
 def test_suspect_failed_strings_require_history_proof(s):
     w = Waiter()
     assert w.feed(ts("running")) is None

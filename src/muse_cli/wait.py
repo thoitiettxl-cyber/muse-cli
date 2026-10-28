@@ -10,9 +10,11 @@ Live `chat.subscribe` events that matter (observed on muse01):
 On subscribe the server first replays the current task.status and
 approvals.snapshot, so a stale "completed" can arrive before the turn we
 care about starts. Only `completed` (DONE) and `interrupted` (FAILED) are
-proven terminal values; every other status string is suspect and needs a
-chat.history proof (see settle). `task_id` is agent identity, not a turn
-epoch: scope by agent/root id + session + running-before-terminal.
+proven terminal values on muse01, with `cancelled`/`canceled` retained as
+FAILED from the pre-existing cancel flow; every other status string is
+suspect and needs a chat.history proof (see settle). `task_id` is agent
+identity, not a turn epoch: scope by agent/root id + session +
+running-before-terminal.
 """
 import json
 import logging
@@ -23,11 +25,16 @@ log = logging.getLogger("muse_cli.wait")
 
 # Proven on muse01 (N=30 turns completed, N=2 cancels interrupted). Every
 # other string is suspect: it may end the wait only with history proof.
+# `cancelled`/`canceled` are retained as proven FAILED from the
+# pre-existing cancel flow (a chat.cancel is confirmed by the server with
+# one of these strings; see test_stop_during_turn): muse01 never observed
+# them, so they are NOT muse01-measured, but dropping them would leave a
+# stopped turn waiting until its timeout. They still need running-seen
+# and never settle from a replay.
 DONE = {"completed"}
-FAILED = {"interrupted"}
+FAILED = {"interrupted", "cancelled", "canceled"}
 SUSPECT_DONE = {"idle", "complete", "done", "finished", "succeeded", "success"}
-SUSPECT_FAILED = {"failed", "failure", "error", "errored", "cancelled",
-                  "canceled", "aborted", "timed_out"}
+SUSPECT_FAILED = {"failed", "failure", "error", "errored", "aborted", "timed_out"}
 TERMINAL = DONE | FAILED | SUSPECT_DONE | SUSPECT_FAILED
 
 EXIT_OK, EXIT_FAILED, EXIT_HUMAN, EXIT_TIMEOUT = 0, 2, 4, 124
