@@ -213,7 +213,16 @@ class Muse:
         """The shared connection, (re)opened if it is missing or dead.
 
         A connection that only *claims* to be alive is probed first when
-        it has been quiet for a heartbeat interval (see _probe_stale)."""
+        it has been quiet for a heartbeat interval (see _probe_stale).
+        _open runs OUTSIDE shared_lock: holding the lock across a
+        connect (up to the connect timeout) would serialise every
+        thread's live() behind one slow handshake. The lock guards only
+        the shared slot: threads that connect at once install the first
+        finisher and close the extra gateway. Lock order: the in-lock
+        liveness probe is a bounded 5 s ping on an already-open socket
+        and acquires no other lock, so there is no inversion with the
+        per-gateway I/O lock (drop()/close() never hold shared_lock
+        while closing)."""
         g = self.shared
         if g is not None and getattr(g, "alive", False):
             if self._probe_stale(g):
@@ -231,16 +240,28 @@ class Muse:
                 self.mark_down(getattr(g, "dead", None) or "closed")
                 self.log.info("gateway connection dropped (%s); reconnecting",
                               getattr(g, "dead", None))
-            t0 = time.monotonic()
+        t0 = time.monotonic()
+        try:
             gw = self._open(cfg)
-            if hasattr(gw, "lease"):
+        except Exception:
+            if old is not None:
+                old.close()  # N4: do not leak the dropped gateway
+            raise
+        with self.shared_lock:
+            installed = self.shared
+            if installed is None and hasattr(gw, "lease"):
                 self.shared = gw
-            else:
+            elif installed is None:
                 # Cannot be shared: the caller owns (and closes) it. Forget
                 # any dead shared gateway so the next call opens fresh.
                 self.shared = None
             self.log.info("gateway connected in %.2fs", time.monotonic() - t0)
         self.mark_up()
+        if installed is not None:
+            gw.close()  # another thread installed meanwhile: use theirs
+            if old is not None:
+                old.close()
+            return installed
         if old is not None:
             old.close()
         return gw
@@ -287,17 +308,40 @@ class Muse:
     def start_heartbeat(self, interval=None):
         """Start the heartbeat thread, restarting it when it died and after
         a stop: a thread reference alone never proves it is alive, and a
-        set stop event from an earlier run must not kill the new thread."""
+        set stop event from an earlier run must not kill the new thread.
+        The loop waits on the stop event captured at ITS start (never a
+        re-read attribute): a stop+restart while the old thread is
+        mid-tick cannot strand it on the new run's event."""
         with self._hb_lock:
             if self._hb is not None and self._hb.is_alive():
                 return
-            self._hb_stop = threading.Event()
+            stop = threading.Event()
+            self._hb_stop = stop
             interval = interval or self.HEARTBEAT
 
             def loop():
-                while not self._hb_stop.wait(min(5, interval)):
+                while not stop.wait(min(5, interval)):
                     try:
                         self._hb_tick(interval)
+                    except BaseException as e:  # noqa: BLE001 - fatal to
+                        # THIS thread (KeyboardInterrupt/SystemExit inside
+                        # a reconnect): log it, clear the slot, and
+                        # restart from a fresh thread unless a stop was
+                        # asked. Restarting in place would deadlock on
+                        # the is_alive check against this dying thread.
+                        # Choice, stated: restart, because a heartbeat
+                        # that stays dead leaves the next silent drop
+                        # undetected until a new CLI command starts one.
+                        self.log.warning("heartbeat thread dying (%s: %s); restarting",
+                                         type(e).__name__, e)
+                        with self._hb_lock:
+                            if self._hb is threading.current_thread():
+                                self._hb = None
+                        if not stop.is_set():
+                            threading.Thread(target=self.start_heartbeat,
+                                             args=(interval,), daemon=True,
+                                             name="muse-heartbeat-restart").start()
+                        return
                     except Exception as e:  # noqa: BLE001 - one bad tick
                         # must not kill the supervisor thread
                         self.log.debug("heartbeat tick failed: %s", e)
@@ -333,8 +377,15 @@ class Muse:
 
     def stop_heartbeat(self):
         with self._hb_lock:
+            old = self._hb
             self._hb_stop.set()
             self._hb = None
+        # Join outside the lock, bounded: the loop waits at most 5 s
+        # between ticks, so a healthy thread exits well inside the
+        # bound; a thread stuck mid-tick (a slow reconnect) is left as
+        # a daemon rather than blocking the caller indefinitely.
+        if old is not None and old is not threading.current_thread():
+            old.join(timeout=6)
 
     def close(self):
         """Stop the heartbeat and close the connection (a CLI command is done)."""
@@ -370,17 +421,28 @@ class Muse:
             return fn(FS(g))
 
 
-_READ_WORDS = ("history", "list", "read", "stat", "get", "identity", "status", "unread",
-               "ping", "approvals", "usage", "session.info")
+# POST reads known to be safe to repeat after a lost reply. Everything
+# else defaults to NOT repeated: repeating a write (or a route with
+# unknown semantics) after a lost reply can double-apply it.
+_READ_METHODS = frozenset({
+    "connection.ping", "custom_connectors.list", "fs.list", "fs.read",
+    "fs.reads", "fs.stat", "fs.stats", "memory.get", "node.list",
+})
 
 
 def _safe_to_repeat(method, route=None):
-    """A request that only reads, so repeating it after a lost reply is harmless."""
+    """A request that only reads, so repeating it after a lost reply is harmless.
+
+    Explicit set: GET routes, plus the named POST reads above. Anything
+    else is NOT repeated — including writes whose names merely contain
+    a read word (state.update, messenger-read.unlock, widgets.state.*)
+    and routes with unknown repeat semantics (shopping.events,
+    subscriptions)."""
     from .gateway import ROUTES
     r = route or ROUTES.get(method) or {}
     if str(r.get("http") or "").upper() == "GET":
         return True
-    return method != "chat.stream" and any(w in method for w in _READ_WORDS)
+    return method in _READ_METHODS
 
 
 class SharedConn:
