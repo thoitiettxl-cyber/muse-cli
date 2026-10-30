@@ -13,6 +13,7 @@
 - `pyproject.toml` holds all packaging metadata (hatchling). The version is
   read from `__version__` in `src/muse_cli/__init__.py`; that is the only
   place it lives.
+- The Go port formerly in `go/` has moved to github.com/thoitiettxl-cyber/castctl (binary `castctl`); it is not in this repo anymore.
 - Fork-only: this repo is github.com/thoitiettxl-cyber/muse-cli. Never install
   from, publish to, or point anything at PyPI or upstream nikships/muse-cli
   (they lack the fork's fixes). Installs come from `git+` the fork's `main`.
