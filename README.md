@@ -24,6 +24,8 @@ A command-line client for your personal muse.ai AI agent: chat from the terminal
 - **Full coverage:** named commands for the common tasks, plus a `raw` escape hatch for all 258 gateway methods.
 - **Agent-ready:** ships an agent skill so coding agents can drive your muse.ai agent for you.
 
+> **The Go implementation has moved.** The Go port of muse-cli now lives in [castctl](https://github.com/thoitiettxl-cyber/castctl) (binary `castctl`, module `github.com/thoitiettxl-cyber/castctl`). This repository keeps only the Python implementation (0.6.1, frozen); the `go/` directory was removed after the migration (castctl PR #6).
+
 ## Agents driving agents
 
 Prompt a coding agent, it activates the muse-cli skill and runs read-only
